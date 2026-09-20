@@ -7,9 +7,13 @@
 #include <vector>
 
 #include "../injection/injector.h"
+#include "name_pool.h"
 
+/* Name fields are pointers into the global name pool (name_pool.h), never
+   owned, never NULL after ingest/load fills them. */
 struct LuaMethodSnapshot {
-    std::string name;
+    const std::string *name;
+    uint32_t method_id;
     uint16_t kind;
     uint16_t flags;
     float self_ms;
@@ -21,13 +25,13 @@ struct LuaMethodSnapshot {
     uint32_t active_at_end;
 
     LuaMethodSnapshot()
-        : kind(0), flags(0), self_ms(0), inclusive_ms(0),
+        : name(0), method_id(0), kind(0), flags(0), self_ms(0), inclusive_ms(0),
           max_self_ms(0), max_inclusive_ms(0), calls_started(0),
           calls_completed(0), active_at_end(0) {}
 };
 
 struct CppMethodSnapshot {
-    std::string name;
+    const std::string *name;
     float total_ms;
     float max_ms;
     float last_ms;
@@ -35,16 +39,22 @@ struct CppMethodSnapshot {
     uint32_t call_sequence;
 
     CppMethodSnapshot()
-        : total_ms(0), max_ms(0), last_ms(0), calls(0), call_sequence(0) {}
+        : name(0), total_ms(0), max_ms(0), last_ms(0), calls(0),
+          call_sequence(0) {}
 };
 
 struct LuaLineSnapshot {
-    std::string source;
-    std::string function_name;
+    const std::string *source;
+    const std::string *function_name;
     int32_t line;
     uint32_t samples;
+    /* Wall time on this line in ms.  `samples` counts VM instruction batches
+       (one per 4000 instructions) and is blind to time spent inside C calls;
+       line_ms is the real clock and is the number to sort by. */
+    float line_ms;
 
-    LuaLineSnapshot() : line(0), samples(0) {}
+    LuaLineSnapshot()
+        : source(0), function_name(0), line(0), samples(0), line_ms(0) {}
 };
 
 struct LuaTraceEventSnapshot {
@@ -55,15 +65,15 @@ struct LuaTraceEventSnapshot {
     uint32_t lua_thread_id;
     uint32_t os_thread_id;
     uint32_t method_id;
-    std::string method_name;
+    const std::string *method_name;
     int16_t depth;
     uint8_t type;
     uint8_t flags;
 
     LuaTraceEventSnapshot()
         : event_sequence(0), qpc(0), time_seconds(0), frame_sequence(0),
-          lua_thread_id(0), os_thread_id(0), method_id(0), depth(0),
-          type(0), flags(0) {}
+          lua_thread_id(0), os_thread_id(0), method_id(0), method_name(0),
+          depth(0), type(0), flags(0) {}
 };
 
 struct FrameSnapshot {
@@ -78,7 +88,12 @@ struct FrameSnapshot {
     float lua_cpu_ms;
     float lua_script_self_ms;
     float lua_c_self_ms;
+    /* Lua time spent in the gap before this frame's window opened -- the Lua
+       the old drawScene-scoped window used to throw away. */
+    float lua_outside_ms;
     float lua_mem_kb;
+    /* Hook events observed.  Multiplied by ~0.23us this is the observer's own
+       cost, which lands in body_ms and not in any Lua metric. */
     uint32_t hook_events;
     uint32_t flags;
     float scene_render_ms;
@@ -93,7 +108,8 @@ struct FrameSnapshot {
           frame_end_time_seconds(0), lua_frame_index(0),
           render_frame_sequence(0), frame_period_ms(0),
           drawscene_body_ms(0), lua_wall_ms(0), lua_cpu_ms(0),
-          lua_script_self_ms(0), lua_c_self_ms(0), lua_mem_kb(0),
+          lua_script_self_ms(0), lua_c_self_ms(0), lua_outside_ms(0),
+          lua_mem_kb(0),
           hook_events(0), flags(0), scene_render_ms(0),
           scene_render_hook_present(false) {}
 };
@@ -106,12 +122,13 @@ inline void cocos_debug_fill_scene_render(FrameSnapshot *frame) {
     frame->scene_render_hook_present = false;
     for (size_t i = 0; i < frame->cpp_methods.size(); i++) {
         const CppMethodSnapshot &item = frame->cpp_methods[i];
-        if (item.name.find("Renderer:render") != std::string::npos) {
+        const std::string &name = cocos_debug_snapshot_text(item.name);
+        if (name.find("Renderer:render") != std::string::npos) {
             if (!best_renderer || item.calls > best_renderer->calls ||
                 item.total_ms > best_renderer->total_ms)
                 best_renderer = &item;
-        } else if (item.name.find("Scene:render") != std::string::npos ||
-                   item.name.find("Scene::render") != std::string::npos) {
+        } else if (name.find("Scene:render") != std::string::npos ||
+                   name.find("Scene::render") != std::string::npos) {
             if (!best_scene || item.calls > best_scene->calls ||
                 item.total_ms > best_scene->total_ms)
                 best_scene = &item;
@@ -165,7 +182,7 @@ private:
     void syncCursorToWriter();
     bool pollIpcOnce();
     bool pollEvents(CocosDebugIpcBlock *ipc);
-    std::string methodName(uint32_t method_id);
+    const std::string *methodName(uint32_t method_id);
 
     CocosDebugInjectionSession *session_;
     CocosDebugIpcFrame *scratch_;
@@ -173,7 +190,7 @@ private:
     uint32_t local_dropped_;
     uint32_t last_event_sequence_;
     uint32_t local_event_dropped_;
-    std::vector<std::string> method_cache_;
+    std::vector<const std::string *> method_cache_;
     FrameQueue queue_;
     mutable CRITICAL_SECTION event_lock_;
     std::deque<LuaTraceEventSnapshot> event_queue_;

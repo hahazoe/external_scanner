@@ -96,6 +96,7 @@ int main(void) {
     CocosDebugLuaProfilerApi api;
     CocosDebugLuaProfilerFrame frame;
     int status;
+    uint32_t i;
 
     L = luaL_newstate();
     if (!L) return 1;
@@ -116,7 +117,8 @@ int main(void) {
         return 1;
     }
     if ((cocos_debug_lua_api_hooks_install(
-             (void *)lua_resume, (void *)lua_newthread) & 1) == 0) {
+             (void *)lua_resume, (void *)lua_newthread,
+             (void *)lua_pcall) & 1) == 0) {
         fail("lua_resume API hook install failed");
     }
     cocos_debug_lua_profiler_start();
@@ -177,6 +179,72 @@ int main(void) {
     cocos_debug_lua_profiler_frame_end(&frame);
     if (status != 0) fail("coroutine did not finish");
     validate_frame("resume", &frame);
+
+    /* An error raised inside a protected call unwinds by longjmp, so the
+       profiler gets no return hooks for the frames in between.  Those frames
+       used to stay on its shadow stack forever; the work that followed in the
+       same frame was then attributed against a stale depth. */
+    run_chunk(L,
+        "function boom() local t = nil return t.x end\n"
+        "function after() local n=0 for i=1,2000 do n=n+i end return n end");
+    cocos_debug_lua_profiler_frame_begin(6);
+    lua_getglobal(L, "boom");
+    status = lua_pcall(L, 0, 0, 0);
+    if (status == 0) fail("boom() did not raise");
+    lua_pop(L, 1);
+    lua_getglobal(L, "after");
+    status = lua_pcall(L, 0, 1, 0);
+    lua_pop(L, 1);
+    cocos_debug_lua_profiler_frame_end(&frame);
+    if (status != 0) fail("after() failed");
+    validate_frame("pcall-error", &frame);
+    for (i = 0; i < frame.method_count; i++) {
+        if (frame.methods[i].active_at_end != 0) {
+            fprintf(stderr,
+                    "[FAIL] method %u still active after a caught error\n",
+                    frame.methods[i].method_id);
+            g_failures++;
+        }
+    }
+
+    /* Line time.  Instruction sampling (one hit per 4000 VM instructions)
+       cannot see time burnt inside a C call: the counter is frozen while the
+       C function runs.  The line entry now also carries a real clock budget,
+       so a line whose whole cost is `busy_c()` shows up with samples near
+       zero but a non-zero time. */
+    cocos_debug_lua_profiler_set_line_capture(1);
+    run_chunk(L,
+        "function cheavy() local n=0 for i=1,4000 do n=n+i end "
+        "busy_c(); return n end");
+    cocos_debug_lua_profiler_frame_begin(7);
+    lua_getglobal(L, "cheavy");
+    status = lua_pcall(L, 0, 0, 0);
+    cocos_debug_lua_profiler_frame_end(&frame);
+    if (status != 0) fail("cheavy failed");
+    {
+        LARGE_INTEGER freq;
+        double total_line_ms = 0.0;
+        uint32_t timed_lines = 0;
+        QueryPerformanceFrequency(&freq);
+        if (!frame.line_count) fail("no line samples with line capture on");
+        for (i = 0; i < frame.line_count; i++) {
+            if (frame.lines[i].qpc > 0) timed_lines++;
+            if (freq.QuadPart)
+                total_line_ms += (double)frame.lines[i].qpc * 1000.0 /
+                                 (double)freq.QuadPart;
+        }
+        if (!timed_lines)
+            fail("no line carries a time budget (line qpc never attributed)");
+        /* Line time is a slice of the same clock as lua_cpu, so it can never
+           add up to more than lua_cpu -- that would mean double counting. */
+        if (total_line_ms > frame.lua_cpu_ms + 0.2) {
+            fprintf(stderr,
+                    "[FAIL] line time %.3f exceeds lua_cpu %.3f\n",
+                    total_line_ms, frame.lua_cpu_ms);
+            g_failures++;
+        }
+    }
+
     if (!g_event_counts[COCOS_DEBUG_IPC_LUA_EVENT_CALL] ||
         !g_event_counts[COCOS_DEBUG_IPC_LUA_EVENT_RETURN] ||
         !g_event_counts[COCOS_DEBUG_IPC_LUA_EVENT_TAIL_RETURN] ||

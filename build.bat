@@ -92,7 +92,7 @@ echo [OK]
 echo === Step 8: recording format test ===
 g++ %CXXFLAGS% -I"%SRC%common" -I"%SRC%injection" -I"%SRC%debugview" ^
   -o "%GEN%\recording_io_test.exe" "%SRC%tests\recording_io_test.cpp" ^
-  "%SRC%debugview\recording_io.cpp" -static-libgcc -static-libstdc++
+  "%SRC%debugview\recording_io.cpp" "%SRC%debugview\name_pool.cpp" -static-libgcc -static-libstdc++
 if errorlevel 1 (echo [X] FAILED && exit /b 1)
 "%GEN%\recording_io_test.exe"
 if errorlevel 1 (echo [X] FAILED && exit /b 1)
@@ -111,7 +111,7 @@ g++ %CXXFLAGS% -I"%SRC%common" -I"%SRC%injection" -I"%SRC%debugview" ^
   -o "%OUT%\debugview.exe" ^
   "%SRC%debugview\main.cpp" "%SRC%debugview\telemetry_client.cpp" ^
   "%SRC%debugview\frame_preview.cpp" "%SRC%debugview\recording_io.cpp" ^
-  "%SRC%debugview\debug_list.cpp" ^
+  "%SRC%debugview\debug_list.cpp" "%SRC%debugview\name_pool.cpp" ^
   %IMGUI_OBJS% ^
   "%GEN%\injector.o" "%GEN%\lua_vm_scan.o" -ld3d9 -lpsapi -lgdi32 -limm32 -luser32 -lcomdlg32 ^
   -static-libgcc -static-libstdc++ -mwindows
@@ -122,7 +122,7 @@ if errorlevel 1 (
     -o "%OUT%\debugview_new.exe" ^
     "%SRC%debugview\main.cpp" "%SRC%debugview\telemetry_client.cpp" ^
     "%SRC%debugview\frame_preview.cpp" "%SRC%debugview\recording_io.cpp" ^
-    "%SRC%debugview\debug_list.cpp" ^
+    "%SRC%debugview\debug_list.cpp" "%SRC%debugview\name_pool.cpp" ^
     %IMGUI_OBJS% ^
     "%GEN%\injector.o" "%GEN%\lua_vm_scan.o" -ld3d9 -lpsapi -lgdi32 -limm32 -luser32 -lcomdlg32 ^
     -static-libgcc -static-libstdc++ -mwindows

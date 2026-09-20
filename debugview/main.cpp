@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -187,6 +188,59 @@ struct InjectionWorkerResult {
     bool success;
 };
 
+/* Measured on this profiler: 300k Lua calls cost 20.8 ms bare and 158.3 ms
+   with the hook installed, i.e. ~0.23 us per hook event.  That cost lands in
+   drawScene body and never in lua_cpu, so it has to be subtracted -- not
+   ignored -- before a frame's Lua share is judged. */
+static const double kHookOverheadMsPerEvent = 0.00023;
+
+/* One Lua method summed over a window of frames.  A single frame is the unit
+   the profiler reports, but the questions that matter ("which method only
+   fires on 20 of 969 frames and still owns half the dropped frames?") cannot
+   be answered from any single frame -- they need the hit count, the
+   distribution, and the split between quiet frames and spike frames. */
+struct MethodAggregate {
+    const std::string *name;
+    uint32_t method_id;
+    uint16_t kind;
+    uint32_t hit_frames;
+    double self_sum;
+    double self_max;
+    double inclusive_sum;
+    uint64_t calls_started;
+    /* Split by frame kind: is this method's cost a constant background, or
+       does it only show up in the frames that blow the budget? */
+    uint32_t baseline_hits;
+    double baseline_self_sum;
+    uint32_t spike_hits;
+    double spike_self_sum;
+    std::vector<float> self_samples;
+
+    MethodAggregate()
+        : name(0), method_id(0), kind(0), hit_frames(0), self_sum(0),
+          self_max(0), inclusive_sum(0), calls_started(0), baseline_hits(0),
+          baseline_self_sum(0), spike_hits(0), spike_self_sum(0) {}
+
+    double selfPerHit() const {
+        return hit_frames ? self_sum / (double)hit_frames : 0.0;
+    }
+    double baselineMean() const {
+        return baseline_hits ? baseline_self_sum / (double)baseline_hits : 0.0;
+    }
+    double spikeMean() const {
+        return spike_hits ? spike_self_sum / (double)spike_hits : 0.0;
+    }
+    double spikeDelta() const { return spikeMean() - baselineMean(); }
+    double p95Self() const {
+        if (self_samples.empty()) return 0.0;
+        std::vector<float> sorted(self_samples);
+        std::sort(sorted.begin(), sorted.end());
+        size_t index = (size_t)(0.95 * (double)(sorted.size() - 1) + 0.5);
+        if (index >= sorted.size()) index = sorted.size() - 1;
+        return (double)sorted[index];
+    }
+};
+
 struct Application {
     CocosDebugProcessInfo processes[256];
     int process_count;
@@ -212,6 +266,24 @@ struct Application {
     float spike_threshold_ms;
     bool show_spike_hints;
     char method_filter[128];
+    /* Cross-frame analysis (aggregate / spike diff / per-method curve). */
+    bool show_cross_frame;
+    char aggregate_filter[128];
+    int aggregate_window;
+    uint32_t selected_method_id;
+    std::string selected_method_label;
+    std::map<uint32_t, size_t> aggregate_index;
+    std::vector<MethodAggregate> aggregates;
+    size_t aggregate_cached_size;
+    uint64_t aggregate_cached_first;
+    DWORD aggregate_last_build;
+    size_t aggregate_frame_count;
+    size_t aggregate_spike_count;
+    double aggregate_median_baseline_ms;
+    std::vector<double> ts_x;
+    std::vector<double> ts_y;
+    std::vector<double> ts_body;
+    bool ts_dirty;
     std::string status_message;
     DWORD last_dock_tick;
     DWORD last_preview_tick;
@@ -225,6 +297,7 @@ struct Application {
     std::vector<double> plot_lua_cpu;
     std::vector<double> plot_lua_self;
     std::vector<double> plot_c_self;
+    std::vector<double> plot_lua_outside;
     size_t plot_begin_index;
     bool show_lua_editor;
     char lua_editor_text[COCOS_DEBUG_IPC_REMOTE_LUA_CAP];
@@ -250,6 +323,11 @@ struct Application {
           selected_sequence(0), paused(false), pending_autosave(false),
           was_recording(false), follow_target(true), frame_window(180.0f),
           spike_threshold_ms(16.67f), show_spike_hints(true),
+          show_cross_frame(false), aggregate_window(600),
+          selected_method_id(0), aggregate_cached_size(0),
+          aggregate_cached_first(0), aggregate_last_build(0),
+          aggregate_frame_count(0), aggregate_spike_count(0),
+          aggregate_median_baseline_ms(0), ts_dirty(true),
           last_dock_tick(0), last_preview_tick(0),
           last_plot_xmin(0), last_plot_xmax(0), plot_begin_index(0),
           show_lua_editor(false),
@@ -261,6 +339,7 @@ struct Application {
         memset(&worker_result, 0, sizeof(worker_result));
         memset(progress_text, 0, sizeof(progress_text));
         memset(method_filter, 0, sizeof(method_filter));
+        memset(aggregate_filter, 0, sizeof(aggregate_filter));
         memset(lua_editor_text, 0, sizeof(lua_editor_text));
         memset(lua_editor_status, 0, sizeof(lua_editor_status));
         memset(lua_editor_error, 0, sizeof(lua_editor_error));
@@ -489,22 +568,31 @@ struct Application {
             pending_trace_events.push_back(events[i]);
         if (!pending_trace_events.empty() && !history.empty()) {
             std::deque<LuaTraceEventSnapshot> still_pending;
+            const uint32_t oldest_frame = history.front().lua_frame_index;
             while (!pending_trace_events.empty()) {
                 LuaTraceEventSnapshot event = pending_trace_events.front();
                 pending_trace_events.pop_front();
                 bool attached = false;
                 if (event.frame_sequence != 0) {
-                    for (std::deque<FrameSnapshot>::reverse_iterator it = history.rbegin();
-                         it != history.rend(); ++it) {
-                        if (it->lua_frame_index == event.frame_sequence) {
-                            it->trace_events.push_back(event);
-                            attached = true;
-                            break;
+                    if (event.frame_sequence < oldest_frame) {
+                        /* Frame already evicted from history: drop the event. */
+                    } else {
+                        /* Trace events are near-real-time; only the history
+                           tail can still match, so don't scan it all. */
+                        size_t scanned = 0;
+                        for (std::deque<FrameSnapshot>::reverse_iterator it = history.rbegin();
+                             it != history.rend() && scanned < 512; ++it, ++scanned) {
+                            if (it->lua_frame_index == event.frame_sequence) {
+                                it->trace_events.push_back(event);
+                                attached = true;
+                                break;
+                            }
                         }
+                        /* Not found yet: frame may still be in flight. */
+                        if (!attached)
+                            still_pending.push_back(event);
                     }
                 }
-                if (!attached && event.frame_sequence != 0)
-                    still_pending.push_back(event);
             }
             pending_trace_events.swap(still_pending);
             while (pending_trace_events.size() > COCOS_DEBUG_IPC_EVENT_CAP)
@@ -555,6 +643,12 @@ struct Application {
         /* While paused, never fall back to the live tail. */
         if (paused) return NULL;
         return &history.back();
+    }
+
+    size_t frameIndexOf(const FrameSnapshot *frame) const {
+        for (size_t i = 0; i < history.size(); i++)
+            if (&history[i] == frame) return i;
+        return (size_t)-1;
     }
 
     void renderProcessPanel() {
@@ -734,8 +828,8 @@ struct Application {
             for (size_t j = 0; j < history[i].cpp_methods.size(); j++) {
                 const CppMethodSnapshot &method = history[i].cpp_methods[j];
                 if (method.calls == 0) continue;
-                if (method.name.find("Renderer:render") != std::string::npos ||
-                    method.name.find("Scene:render") != std::string::npos)
+                if (cocos_debug_snapshot_text(method.name).find("Renderer:render") != std::string::npos ||
+                    cocos_debug_snapshot_text(method.name).find("Scene:render") != std::string::npos)
                     return true;
             }
         }
@@ -765,6 +859,7 @@ struct Application {
         plot_lua_cpu.resize(n);
         plot_lua_self.resize(n);
         plot_c_self.resize(n);
+        plot_lua_outside.resize(n);
         for (i = 0; i < n; i++) {
             const FrameSnapshot &frame = history[begin + i];
             plot_x[i] = (double)frame.lua_frame_index;
@@ -775,6 +870,7 @@ struct Application {
             plot_lua_cpu[i] = frame.lua_cpu_ms;
             plot_lua_self[i] = frame.lua_script_self_ms;
             plot_c_self[i] = frame.lua_c_self_ms;
+            plot_lua_outside[i] = frame.lua_outside_ms;
         }
     }
 
@@ -808,6 +904,7 @@ struct Application {
         std::vector<double> &lua_cpu = plot_lua_cpu;
         std::vector<double> &lua_self = plot_lua_self;
         std::vector<double> &c_self = plot_c_self;
+        std::vector<double> &lua_outside = plot_lua_outside;
 
         /* Visible-window summaries use v7 Body for slow frames and Lua wall for Lua heat. */
         int over_count = 0;
@@ -865,6 +962,7 @@ struct Application {
                 ImPlot::PlotLine("Lua CPU", &x[0], &lua_cpu[0], (int)x.size());
                 ImPlot::PlotLine("Lua self", &x[0], &lua_self[0], (int)x.size());
                 ImPlot::PlotLine("C self", &x[0], &c_self[0], (int)x.size());
+                ImPlot::PlotLine("Lua outside", &x[0], &lua_outside[0], (int)x.size());
             }
             {
                 ImPlotRect limits = ImPlot::GetPlotLimits();
@@ -1141,9 +1239,36 @@ struct Application {
                     frame->lua_frame_index, frame->render_frame_sequence,
                     frame->frame_period_ms, frame->drawscene_body_ms,
                     frame->hook_events, (unsigned)frame->trace_events.size());
-        ImGui::Text("Lua wall %.3f ms | CPU %.3f ms | Lua self %.3f ms | C self %.3f ms",
+        ImGui::Text("Lua wall %.3f ms | CPU %.3f ms | Lua self %.3f ms | C self %.3f ms | "
+                    "outside window %.3f ms",
                     frame->lua_wall_ms, frame->lua_cpu_ms,
-                    frame->lua_script_self_ms, frame->lua_c_self_ms);
+                    frame->lua_script_self_ms, frame->lua_c_self_ms,
+                    frame->lua_outside_ms);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("outside window = Lua that ran in the gap before this\n"
+                              "frame's window opened. It is real Lua cost this frame\n"
+                              "has to make room for, but it is NOT inside lua_cpu\n"
+                              "and is not attributed to any method.");
+        {
+            /* Lua memory is the only GC-pressure signal Lua 5.1 gives us
+               (no generational stats, no pause/step counters): a sawtooth is
+               normal, a monotone climb is a leak, and a jump inside one frame
+               is a table/string storm. */
+            size_t index = frameIndexOf(frame);
+            float previous_mem = 0.0f;
+            bool has_previous = index != (size_t)-1 && index > 0;
+            if (has_previous) previous_mem = history[index - 1].lua_mem_kb;
+            ImGui::Text("Lua memory %.1f KB (%+.1f KB/frame) | observer overhead ~%.3f ms "
+                        "(%u hook events)",
+                        frame->lua_mem_kb,
+                        has_previous ? frame->lua_mem_kb - previous_mem : 0.0f,
+                        (double)frame->hook_events * kHookOverheadMsPerEvent,
+                        frame->hook_events);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Observer overhead is the profiler's own hook cost\n"
+                                  "(~0.23 us per event). It lands in Body, not in any\n"
+                                  "Lua metric -- subtract it before blaming Lua.");
+        }
         ImGui::TextDisabled("frame time %.6f -> %.6f s",
                             frame->frame_begin_time_seconds,
                             frame->frame_end_time_seconds);
@@ -1166,20 +1291,23 @@ struct Application {
             } else {
                 std::vector<size_t> line_order;
                 uint64_t total_line_samples = 0;
+                double total_line_ms = 0.0;
                 for (size_t i = 0; i < frame->lua_lines.size(); i++)
                 {
                     line_order.push_back(i);
                     total_line_samples += frame->lua_lines[i].samples;
+                    total_line_ms += (double)frame->lua_lines[i].line_ms;
                 }
-                if (ImGui::BeginTable("lua_lines", 5,
+                if (ImGui::BeginTable("lua_lines", 6,
                         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                         ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                         ImGuiTableFlags_Sortable,
                         ImVec2(-1, 180))) {
                     ImGui::TableSetupColumn("Source");
                     ImGui::TableSetupColumn("Line");
-                    ImGui::TableSetupColumn("Samples", ImGuiTableColumnFlags_DefaultSort |
-                                                      ImGuiTableColumnFlags_PreferSortDescending);
+                    ImGui::TableSetupColumn("Time ms", ImGuiTableColumnFlags_DefaultSort |
+                                                       ImGuiTableColumnFlags_PreferSortDescending);
+                    ImGui::TableSetupColumn("Samples");
                     ImGui::TableSetupColumn("Share");
                     ImGui::TableSetupColumn("Function");
                     ImGui::TableHeadersRow();
@@ -1196,11 +1324,14 @@ struct Application {
                         const LuaLineSnapshot &rhs = frame->lua_lines[b];
                         int comparison = 0;
                         switch (sort_column) {
-                        case 0: comparison = lhs.source.compare(rhs.source); break;
+                        case 0: comparison = cocos_debug_snapshot_text(lhs.source).compare(
+                                cocos_debug_snapshot_text(rhs.source)); break;
                         case 1: comparison = lhs.line < rhs.line ? -1 : lhs.line > rhs.line; break;
-                        case 2: comparison = lhs.samples < rhs.samples ? -1 : lhs.samples > rhs.samples; break;
+                        case 2: comparison = lhs.line_ms < rhs.line_ms ? -1 : lhs.line_ms > rhs.line_ms; break;
                         case 3: comparison = lhs.samples < rhs.samples ? -1 : lhs.samples > rhs.samples; break;
-                        default: comparison = lhs.function_name.compare(rhs.function_name); break;
+                        case 4: comparison = lhs.samples < rhs.samples ? -1 : lhs.samples > rhs.samples; break;
+                        default: comparison = cocos_debug_snapshot_text(lhs.function_name).compare(
+                                cocos_debug_snapshot_text(rhs.function_name)); break;
                         }
                         return ascending ? comparison < 0 : comparison > 0;
                     });
@@ -1209,27 +1340,38 @@ struct Application {
                     while (clipper.Step()) {
                         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
                             const LuaLineSnapshot &item = frame->lua_lines[line_order[row]];
+                            const std::string &item_source = cocos_debug_snapshot_text(item.source);
                             ImGui::TableNextRow();
                             ImGui::TableNextColumn();
-                            ImGui::TextUnformatted(item.source.c_str());
+                            ImGui::TextUnformatted(item_source.c_str());
                             if (ImGui::IsItemHovered()) {
-                                std::string dump = findDumpFileForSource(item.source);
+                                std::string dump = findDumpFileForSource(item_source);
                                 if (!dump.empty())
-                                    ImGui::SetTooltip("%s\nDump: %s", item.source.c_str(), dump.c_str());
+                                    ImGui::SetTooltip("%s\nDump: %s", item_source.c_str(), dump.c_str());
                                 else
-                                    ImGui::SetTooltip("%s", item.source.c_str());
+                                    ImGui::SetTooltip("%s", item_source.c_str());
                             }
                             ImGui::TableNextColumn(); ImGui::Text("%d", (int)item.line);
+                            ImGui::TableNextColumn(); ImGui::Text("%.3f", item.line_ms);
                             ImGui::TableNextColumn(); ImGui::Text("%u", item.samples);
                             ImGui::TableNextColumn(); ImGui::Text(
-                                "%.1f%%", total_line_samples
-                                    ? 100.0 * (double)item.samples /
-                                      (double)total_line_samples
-                                    : 0.0);
-                            ImGui::TableNextColumn(); ImGui::TextUnformatted(item.function_name.c_str());
+                                "%.1f%%", total_line_ms > 0.0
+                                    ? 100.0 * (double)item.line_ms / total_line_ms
+                                    : (total_line_samples
+                                        ? 100.0 * (double)item.samples /
+                                          (double)total_line_samples
+                                        : 0.0));
+                            ImGui::TableNextColumn(); ImGui::TextUnformatted(
+                                cocos_debug_snapshot_text(item.function_name).c_str());
                         }
                     }
                     ImGui::EndTable();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Time ms is wall time on the line, including\n"
+                                          "time spent inside C calls made from it.\n"
+                                          "Samples counts VM instruction batches (1 per 4000\n"
+                                          "instructions) and is blind to C time -- sort by\n"
+                                          "Time ms, not Samples.");
                 }
             }
         }
@@ -1237,7 +1379,8 @@ struct Application {
                                  method_filter, sizeof(method_filter));
         std::vector<size_t> order;
         for (size_t i = 0; i < frame->lua_methods.size(); i++)
-            if (containsInsensitive(frame->lua_methods[i].name, method_filter)) order.push_back(i);
+            if (containsInsensitive(cocos_debug_snapshot_text(frame->lua_methods[i].name),
+                                    method_filter)) order.push_back(i);
         if (ImGui::BeginTable("lua_methods", 10,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
@@ -1267,7 +1410,8 @@ struct Application {
                 const LuaMethodSnapshot &rhs = frame->lua_methods[b];
                 int comparison = 0;
                 switch (sort_column) {
-                case 0: comparison = lhs.name.compare(rhs.name); break;
+                case 0: comparison = cocos_debug_snapshot_text(lhs.name).compare(
+                        cocos_debug_snapshot_text(rhs.name)); break;
                 case 1: comparison = lhs.kind < rhs.kind ? -1 : lhs.kind > rhs.kind; break;
                 case 2: comparison = lhs.flags < rhs.flags ? -1 : lhs.flags > rhs.flags; break;
                 case 3: comparison = lhs.self_ms < rhs.self_ms ? -1 : lhs.self_ms > rhs.self_ms; break;
@@ -1293,7 +1437,8 @@ struct Application {
                     const LuaMethodSnapshot &item = frame->lua_methods[order[row]];
                     std::string method_flags = luaMethodFlagsText(item.flags);
                     ImGui::TableNextRow();
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(item.name.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(
+                        cocos_debug_snapshot_text(item.name).c_str());
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(luaMethodKindName(item.kind));
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(method_flags.c_str());
                     ImGui::TableNextColumn(); ImGui::Text("%.3f", item.self_ms);
@@ -1321,7 +1466,8 @@ struct Application {
             for (size_t i = 0; i < frame->cpp_methods.size(); i++) {
                 const CppMethodSnapshot &item = frame->cpp_methods[i];
                 ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(item.name.c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(
+                    cocos_debug_snapshot_text(item.name).c_str());
                 ImGui::TableNextColumn(); ImGui::Text("%.3f", item.total_ms);
                 ImGui::TableNextColumn(); ImGui::Text("%.3f", item.max_ms);
                 ImGui::TableNextColumn(); ImGui::Text("%.3f", item.last_ms);
@@ -1370,7 +1516,7 @@ struct Application {
                         ImGui::TableNextColumn(); ImGui::Text("0x%02X", event.flags);
                         ImGui::TableNextColumn(); ImGui::Text("%u", event.method_id);
                         ImGui::TableNextColumn(); ImGui::TextUnformatted(
-                            event.method_name.c_str());
+                            cocos_debug_snapshot_text(event.method_name).c_str());
                     }
                 }
                 ImGui::EndTable();
@@ -1415,7 +1561,390 @@ struct Application {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua C self");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_c_self_ms);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("C self / Lua CPU is the share of Lua time spent\n"
+                                  "inside C functions called from Lua. A third or more\n"
+                                  "usually means tolua bindings or iterators, not Lua.");
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua outside window");
+            ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_outside_ms);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Lua that ran in the gap before this frame's window.\n"
+                                  "Not in Lua CPU, not attributed to any method.");
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Observer overhead (est)");
+            ImGui::TableNextColumn(); ImGui::Text("%.3f",
+                (double)frame->hook_events * kHookOverheadMsPerEvent);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%u hook events x ~0.23 us. This is the profiler's\n"
+                                  "own cost and sits inside Body, so Body minus this\n"
+                                  "is what the game would cost unobserved.",
+                                  frame->hook_events);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua memory");
+            {
+                size_t index = frameIndexOf(frame);
+                float previous_mem = 0.0f;
+                bool has_previous = index != (size_t)-1 && index > 0;
+                if (has_previous) previous_mem = history[index - 1].lua_mem_kb;
+                ImGui::TableNextColumn();
+                ImGui::Text("%.1f KB (%+.1f)", frame->lua_mem_kb,
+                            has_previous ? frame->lua_mem_kb - previous_mem : 0.0f);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Lua 5.1 exposes no GC-phase stats, so total Lua\n"
+                                  "bytes is the only pressure signal: a sawtooth is a\n"
+                                  "healthy collect cycle, a monotone climb is a leak.");
             ImGui::EndTable();
+        }
+    }
+
+    /* ---------- cross-frame analysis: aggregate / spike diff / curve ---------- */
+
+    size_t aggregateBeginIndex() const {
+        size_t n = history.size();
+        size_t window = aggregate_window > 0 ? (size_t)aggregate_window : n;
+        return n > window ? n - window : 0;
+    }
+
+    void rebuildAggregates(bool force) {
+        DWORD now = GetTickCount();
+        size_t n = history.size();
+        uint64_t first = history.empty() ? 0 : history.front().publish_sequence;
+        if (!force && n == aggregate_cached_size &&
+            first == aggregate_cached_first && now - aggregate_last_build < 500)
+            return;
+        aggregate_cached_size = n;
+        aggregate_cached_first = first;
+        aggregate_last_build = now;
+        aggregates.clear();
+        aggregate_index.clear();
+        aggregate_frame_count = 0;
+        aggregate_spike_count = 0;
+        aggregate_median_baseline_ms = 0;
+        if (n == 0) {
+            ts_dirty = true;
+            return;
+        }
+        float thr = spike_threshold_ms;
+        size_t begin = aggregateBeginIndex();
+        std::vector<float> baseline_body;
+        baseline_body.reserve(n - begin);
+        for (size_t i = begin; i < n; i++) {
+            const FrameSnapshot &f = history[i];
+            bool spike = f.drawscene_body_ms > thr;
+            aggregate_frame_count++;
+            if (spike)
+                aggregate_spike_count++;
+            else
+                baseline_body.push_back(f.drawscene_body_ms);
+            for (size_t j = 0; j < f.lua_methods.size(); j++) {
+                const LuaMethodSnapshot &m = f.lua_methods[j];
+                if (!m.method_id) continue;
+                std::map<uint32_t, size_t>::iterator it =
+                    aggregate_index.find(m.method_id);
+                size_t slot;
+                if (it == aggregate_index.end()) {
+                    MethodAggregate agg;
+                    agg.method_id = m.method_id;
+                    agg.name = m.name;
+                    agg.kind = m.kind;
+                    slot = aggregates.size();
+                    aggregate_index[m.method_id] = slot;
+                    aggregates.push_back(agg);
+                } else {
+                    slot = it->second;
+                }
+                MethodAggregate &agg = aggregates[slot];
+                agg.hit_frames++;
+                agg.self_sum += (double)m.self_ms;
+                agg.inclusive_sum += (double)m.inclusive_ms;
+                agg.calls_started += m.calls_started;
+                if ((double)m.self_ms > agg.self_max) agg.self_max = (double)m.self_ms;
+                agg.self_samples.push_back(m.self_ms);
+                if (spike) {
+                    agg.spike_hits++;
+                    agg.spike_self_sum += (double)m.self_ms;
+                } else {
+                    agg.baseline_hits++;
+                    agg.baseline_self_sum += (double)m.self_ms;
+                }
+            }
+        }
+        if (!baseline_body.empty()) {
+            std::sort(baseline_body.begin(), baseline_body.end());
+            aggregate_median_baseline_ms =
+                (double)baseline_body[baseline_body.size() / 2];
+        }
+        ts_dirty = true;
+    }
+
+    void rebuildTimeSeries() {
+        ts_x.clear();
+        ts_y.clear();
+        ts_body.clear();
+        if (!selected_method_id) return;
+        size_t begin = aggregateBeginIndex();
+        for (size_t i = begin; i < history.size(); i++) {
+            const FrameSnapshot &f = history[i];
+            double value = 0.0;
+            for (size_t j = 0; j < f.lua_methods.size(); j++) {
+                if (f.lua_methods[j].method_id == selected_method_id)
+                    value += (double)f.lua_methods[j].self_ms;
+            }
+            ts_x.push_back((double)f.lua_frame_index);
+            ts_y.push_back(value);
+            ts_body.push_back((double)f.drawscene_body_ms);
+        }
+        ts_dirty = false;
+    }
+
+    void selectMethod(uint32_t method_id, const std::string *name) {
+        selected_method_id = method_id;
+        selected_method_label = name ? cocos_debug_snapshot_text(name)
+                                     : std::string();
+        ts_dirty = true;
+    }
+
+    void renderCrossFramePanel() {
+        if (!ImGui::CollapsingHeader("Cross-frame analysis##cross_frame"))
+            return;
+        rebuildAggregates(false);
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderInt("Window (frames)##agg_window", &aggregate_window,
+                         60, 4000);
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh##agg_refresh"))
+            rebuildAggregates(true);
+        ImGui::SameLine();
+        ImGui::TextDisabled("budget %.2f ms", spike_threshold_ms);
+        ImGui::Text("Frames %u | over budget %u (%.1f%%) | median quiet body %.2f ms",
+                    (unsigned)aggregate_frame_count,
+                    (unsigned)aggregate_spike_count,
+                    aggregate_frame_count
+                        ? 100.0 * (double)aggregate_spike_count /
+                              (double)aggregate_frame_count : 0.0,
+                    aggregate_median_baseline_ms);
+        if (history.empty()) {
+            ImGui::TextDisabled("No frames yet.");
+            return;
+        }
+        ImGui::InputTextWithHint("##aggregate_filter", "Filter methods",
+                                 aggregate_filter, sizeof(aggregate_filter));
+
+        std::vector<size_t> order;
+        for (size_t i = 0; i < aggregates.size(); i++) {
+            if (containsInsensitive(cocos_debug_snapshot_text(aggregates[i].name),
+                                    aggregate_filter))
+                order.push_back(i);
+        }
+
+        /* ---- aggregate table ---- */
+        if (ImGui::BeginTable("cross_aggregate", 10,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable,
+                ImVec2(-1, 220))) {
+            ImGui::TableSetupColumn("Method");
+            ImGui::TableSetupColumn("Kind");
+            ImGui::TableSetupColumn("Hit frames");
+            ImGui::TableSetupColumn("Hit %");
+            ImGui::TableSetupColumn("Self total", ImGuiTableColumnFlags_DefaultSort |
+                                                  ImGuiTableColumnFlags_PreferSortDescending);
+            ImGui::TableSetupColumn("Self/hit");
+            ImGui::TableSetupColumn("p95 self");
+            ImGui::TableSetupColumn("Max self");
+            ImGui::TableSetupColumn("Incl total");
+            ImGui::TableSetupColumn("Calls");
+            ImGui::TableHeadersRow();
+            ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
+            int sort_column = 4;
+            bool ascending = false;
+            if (sort_specs && sort_specs->SpecsCount > 0) {
+                sort_column = sort_specs->Specs[0].ColumnIndex;
+                ascending = sort_specs->Specs[0].SortDirection ==
+                            ImGuiSortDirection_Ascending;
+            }
+            std::sort(order.begin(), order.end(),
+                      [this, sort_column, ascending](size_t a, size_t b) {
+                const MethodAggregate &lhs = aggregates[a];
+                const MethodAggregate &rhs = aggregates[b];
+                int comparison = 0;
+                switch (sort_column) {
+                case 0: comparison = cocos_debug_snapshot_text(lhs.name).compare(
+                            cocos_debug_snapshot_text(rhs.name)); break;
+                case 1: comparison = lhs.kind < rhs.kind ? -1 : lhs.kind > rhs.kind; break;
+                case 2: comparison = lhs.hit_frames < rhs.hit_frames ? -1 :
+                                     lhs.hit_frames > rhs.hit_frames; break;
+                case 3: comparison = lhs.hit_frames < rhs.hit_frames ? -1 :
+                                     lhs.hit_frames > rhs.hit_frames; break;
+                case 4: comparison = lhs.self_sum < rhs.self_sum ? -1 :
+                                     lhs.self_sum > rhs.self_sum; break;
+                case 5: comparison = lhs.selfPerHit() < rhs.selfPerHit() ? -1 :
+                                     lhs.selfPerHit() > rhs.selfPerHit(); break;
+                case 6: comparison = lhs.p95Self() < rhs.p95Self() ? -1 :
+                                     lhs.p95Self() > rhs.p95Self(); break;
+                case 7: comparison = lhs.self_max < rhs.self_max ? -1 :
+                                     lhs.self_max > rhs.self_max; break;
+                case 8: comparison = lhs.inclusive_sum < rhs.inclusive_sum ? -1 :
+                                     lhs.inclusive_sum > rhs.inclusive_sum; break;
+                default: comparison = lhs.calls_started < rhs.calls_started ? -1 :
+                                      lhs.calls_started > rhs.calls_started; break;
+                }
+                return ascending ? comparison < 0 : comparison > 0;
+            });
+            ImGuiListClipper clipper;
+            clipper.Begin((int)order.size());
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                    const MethodAggregate &item = aggregates[order[(size_t)row]];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::PushID((int)item.method_id);
+                    if (ImGui::Selectable(cocos_debug_snapshot_text(item.name).c_str(),
+                                          item.method_id == selected_method_id,
+                                          ImGuiSelectableFlags_SpanAllColumns))
+                        selectMethod(item.method_id, item.name);
+                    ImGui::PopID();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(luaMethodKindName(item.kind));
+                    ImGui::TableNextColumn(); ImGui::Text("%u", item.hit_frames);
+                    ImGui::TableNextColumn(); ImGui::Text("%.1f%%",
+                        aggregate_frame_count
+                            ? 100.0 * (double)item.hit_frames /
+                              (double)aggregate_frame_count : 0.0);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", item.self_sum);
+                    ImGui::TableNextColumn(); ImGui::Text("%.3f", item.selfPerHit());
+                    ImGui::TableNextColumn(); ImGui::Text("%.3f", item.p95Self());
+                    ImGui::TableNextColumn(); ImGui::Text("%.3f", item.self_max);
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", item.inclusive_sum);
+                    ImGui::TableNextColumn(); ImGui::Text("%llu",
+                        (unsigned long long)item.calls_started);
+                }
+            }
+            ImGui::EndTable();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Hit frames = frames this method appears in.\n"
+                              "A method with few hits and a high p95 is a "
+                              "periodic spike, not a hot loop.\n"
+                              "Click a row to plot its self time per frame.");
+
+        /* ---- spike attribution ---- */
+        std::vector<size_t> spike_order;
+        for (size_t i = 0; i < aggregates.size(); i++) {
+            const MethodAggregate &item = aggregates[i];
+            if (!item.spike_hits) continue;
+            if (!containsInsensitive(cocos_debug_snapshot_text(item.name),
+                                     aggregate_filter))
+                continue;
+            spike_order.push_back(i);
+        }
+        std::sort(spike_order.begin(), spike_order.end(),
+                  [this](size_t a, size_t b) {
+            double lhs = aggregates[a].spikeDelta();
+            double rhs = aggregates[b].spikeDelta();
+            if (lhs != rhs) return lhs > rhs;
+            return aggregates[a].spike_hits > aggregates[b].spike_hits;
+        });
+        if (ImGui::CollapsingHeader("Spike attribution (self ms above quiet baseline)##cross_spike",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (aggregate_spike_count == 0) {
+                ImGui::TextDisabled("No frame in this window exceeded %.2f ms.",
+                                    spike_threshold_ms);
+            } else if (ImGui::BeginTable("cross_spike_table", 6,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                    ImGuiTableFlags_Sortable, ImVec2(-1, 200))) {
+                ImGui::TableSetupColumn("Method");
+                ImGui::TableSetupColumn("Delta self", ImGuiTableColumnFlags_DefaultSort |
+                                                      ImGuiTableColumnFlags_PreferSortDescending);
+                ImGui::TableSetupColumn("Spike mean");
+                ImGui::TableSetupColumn("Quiet mean");
+                ImGui::TableSetupColumn("Spike hits");
+                ImGui::TableSetupColumn("Coverage");
+                ImGui::TableHeadersRow();
+                ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
+                int sort_column = 1;
+                bool ascending = false;
+                if (sort_specs && sort_specs->SpecsCount > 0) {
+                    sort_column = sort_specs->Specs[0].ColumnIndex;
+                    ascending = sort_specs->Specs[0].SortDirection ==
+                                ImGuiSortDirection_Ascending;
+                }
+                if (sort_column != 1 || ascending)
+                    std::sort(spike_order.begin(), spike_order.end(),
+                              [this, sort_column, ascending](size_t a, size_t b) -> bool {
+                        const MethodAggregate &lhs = aggregates[a];
+                        const MethodAggregate &rhs = aggregates[b];
+                        int comparison = 0;
+                        switch (sort_column) {
+                        case 0: comparison = cocos_debug_snapshot_text(lhs.name).compare(
+                                    cocos_debug_snapshot_text(rhs.name)); break;
+                        case 2: comparison = lhs.spikeMean() < rhs.spikeMean() ? -1 :
+                                             lhs.spikeMean() > rhs.spikeMean(); break;
+                        case 3: comparison = lhs.baselineMean() < rhs.baselineMean() ? -1 :
+                                             lhs.baselineMean() > rhs.baselineMean(); break;
+                        case 4: comparison = lhs.spike_hits < rhs.spike_hits ? -1 :
+                                             lhs.spike_hits > rhs.spike_hits; break;
+                        default: comparison = lhs.spike_hits < rhs.spike_hits ? -1 :
+                                              lhs.spike_hits > rhs.spike_hits; break;
+                        }
+                        return ascending ? comparison < 0 : comparison > 0;
+                    });
+                const size_t kMaxRows = 40;
+                ImGuiListClipper clipper;
+                clipper.Begin((int)(spike_order.size() < kMaxRows
+                                        ? spike_order.size() : kMaxRows));
+                while (clipper.Step()) {
+                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                        const MethodAggregate &item =
+                            aggregates[spike_order[(size_t)row]];
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::PushID((int)item.method_id);
+                        if (ImGui::Selectable(
+                                cocos_debug_snapshot_text(item.name).c_str(),
+                                item.method_id == selected_method_id,
+                                ImGuiSelectableFlags_SpanAllColumns))
+                            selectMethod(item.method_id, item.name);
+                        ImGui::PopID();
+                        ImGui::TableNextColumn();
+                        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.25f, 1.0f),
+                                           "%+.3f", item.spikeDelta());
+                        ImGui::TableNextColumn(); ImGui::Text("%.3f", item.spikeMean());
+                        ImGui::TableNextColumn(); ImGui::Text("%.3f", item.baselineMean());
+                        ImGui::TableNextColumn(); ImGui::Text("%u", item.spike_hits);
+                        ImGui::TableNextColumn(); ImGui::Text("%.0f%%",
+                            100.0 * (double)item.spike_hits /
+                                (double)aggregate_spike_count);
+                    }
+                }
+                ImGui::EndTable();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Delta = mean self on over-budget frames minus\n"
+                                  "mean self on quiet frames. Coverage = share of\n"
+                                  "over-budget frames this method appears in.\n"
+                                  "High delta + low coverage = intermittent cause;\n"
+                                  "high delta + 100%% coverage = constant cost.");
+        }
+
+        /* ---- per-method curve ---- */
+        if (ts_dirty) rebuildTimeSeries();
+        if (selected_method_id && !ts_x.empty()) {
+            ImGui::TextUnformatted(selected_method_label.c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("Clear##ts_clear"))
+                selectMethod(0, 0);
+            if (ImPlot::BeginPlot("method self##cross_ts", ImVec2(-1, 200))) {
+                ImPlot::SetupAxes("frame", "ms");
+                ImPlot::PlotLine("body", &ts_x[0], &ts_body[0], (int)ts_x.size());
+                ImPlot::PlotLine("self", &ts_x[0], &ts_y[0], (int)ts_x.size());
+                ImPlot::EndPlot();
+            }
+        } else if (!selected_method_id) {
+            ImGui::TextDisabled("Select a method above to plot its self time per frame.");
         }
     }
 
@@ -2041,6 +2570,7 @@ struct Application {
         renderControls();
         renderPlot();
         renderFrameDetails();
+        renderCrossFramePanel();
         ImGui::End();
         renderLuaEditor();
         renderDebugList();

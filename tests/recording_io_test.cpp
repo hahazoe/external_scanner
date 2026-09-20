@@ -55,7 +55,7 @@ static void test_round_trip(const char *path) {
     frame.hook_events = 123;
     frame.flags = COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED;
 
-    method.name = "foo.lua:10:Lua:update";
+    method.name = cocos_debug_pool_intern("foo.lua:10:Lua:update");
     method.kind = COCOS_DEBUG_IPC_LUA_METHOD_LUA;
     method.self_ms = 4.0f;
     method.inclusive_ms = 9.0f;
@@ -66,7 +66,7 @@ static void test_round_trip(const char *path) {
     method.active_at_end = 1;
     frame.lua_methods.push_back(method);
 
-    cpp.name = "cocos2d::Director::drawScene";
+    cpp.name = cocos_debug_pool_intern("cocos2d::Director::drawScene");
     cpp.total_ms = 25.0f;
     cpp.max_ms = 25.0f;
     cpp.last_ms = 25.0f;
@@ -74,7 +74,7 @@ static void test_round_trip(const char *path) {
     cpp.call_sequence = 77;
     frame.cpp_methods.push_back(cpp);
 
-    line.source = "foo.lua";
+    line.source = cocos_debug_pool_intern("foo.lua");
     line.function_name = method.name;
     line.line = 12;
     line.samples = 5;

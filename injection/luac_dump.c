@@ -5,6 +5,10 @@
  *
  * Full source decompilation is not available from undump; plaintext here means
  * the string constants / source names / locals that LoadString materializes.
+ *
+ * loadbuffer chunks are copied on the calling thread; loadfile hooks only
+ * record the path and the writer thread performs the disk read, so the
+ * game's loading path never pays our I/O cost.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -16,6 +20,8 @@
 #include <stdarg.h>
 
 #include "luac_dump.h"
+#include "x86_insn.h"
+#include "patch_freeze.h"
 
 #define LUA_SIGNATURE_0 0x1B
 typedef struct lua_State lua_State;
@@ -33,6 +39,7 @@ typedef struct DumpJob {
     char *chunk_name;
     char module_name[DUMP_NAME_CAP];
     int is_bin;
+    int from_file; /* buf empty: writer thread reads the file at chunk_name */
 } DumpJob;
 
 static char g_dump_dir[MAX_PATH];
@@ -483,7 +490,40 @@ static void write_dump_job(DumpJob *job) {
     char path_txt[MAX_PATH];
     FILE *fp;
 
-    if (!job || !g_dump_dir[0] || !job->module_name[0] || !job->buf || job->size == 0) {
+    if (!job || !g_dump_dir[0] || !job->module_name[0]) {
+        free_dump_job(job);
+        return;
+    }
+
+    /* File-referenced job: disk I/O happens here, on the writer thread,
+       never on the game's loading path. */
+    if (job->from_file) {
+        fp = fopen(job->chunk_name ? job->chunk_name : "", "rb");
+        if (fp) {
+            long sz;
+            if (fseek(fp, 0, SEEK_END) == 0 && (sz = ftell(fp)) > 0 &&
+                sz < 32 * 1024 * 1024) {
+                job->buf = (unsigned char *)malloc((size_t)sz);
+                if (job->buf) {
+                    fseek(fp, 0, SEEK_SET);
+                    if (fread(job->buf, 1, (size_t)sz, fp) == (size_t)sz)
+                        job->size = (size_t)sz;
+                    else {
+                        free(job->buf);
+                        job->buf = NULL;
+                    }
+                }
+            }
+            fclose(fp);
+        }
+        if (!job->buf) {
+            free_dump_job(job);
+            return;
+        }
+        job->is_bin = job->buf[0] == LUA_SIGNATURE_0;
+    }
+
+    if (!job->buf || job->size == 0) {
         free_dump_job(job);
         return;
     }
@@ -640,62 +680,62 @@ static void dump_chunk(const void *buf, size_t size, const char *name) {
     enqueue_dump_chunk(buf, size, name);
 }
 
-/* ---- prologue hook helpers ---- */
+/*
+ * loadfile hook: only capture the path on the game thread. The writer
+ * thread opens and reads the file itself, so the game's loading path never
+ * pays for our disk I/O (loading screens can fire hundreds of these).
+ */
+static void enqueue_dump_file(const char *filename) {
+    DumpJob *job;
+    char module_name[DUMP_NAME_CAP];
+    char full_path[MAX_PATH];
+    const char *name = filename;
 
-static int x86_modrm_size(const uint8_t *p) {
-    uint8_t modrm = p[0];
-    int mod = modrm >> 6;
-    int rm = modrm & 7;
-    int n = 1;
-    if (mod == 3) return 1;
-    if (rm == 4) {
-        n++;
-        if (mod == 0 && (p[1] & 7) == 5) n += 4;
-    } else if (mod == 0 && rm == 5) {
-        n += 4;
+    if (!g_dump_dir[0] || !filename || !filename[0]) return;
+    /* Resolve now: the game CWD may differ when the writer thread runs. */
+    if (GetFullPathNameA(filename, sizeof(full_path), full_path, NULL))
+        name = full_path;
+    if (should_skip(name, NULL, 0)) return;
+    if (!ensure_dump_writer()) return;
+
+    relative_path_from_chunk(name, module_name, sizeof(module_name));
+
+    EnterCriticalSection(&g_dump_lock);
+    if (dump_seen_contains(module_name) || g_dump_q_count >= DUMP_QUEUE_CAP) {
+        LeaveCriticalSection(&g_dump_lock);
+        return;
     }
-    if (mod == 1) n += 1;
-    else if (mod == 2) n += 4;
-    return n;
-}
+    LeaveCriticalSection(&g_dump_lock);
 
-static int x86_insn_len(const uint8_t *p) {
-    int i = 0, n;
-    uint8_t op;
-    while (i < 4) {
-        uint8_t b = p[i];
-        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) {
-            i++;
-            continue;
+    job = (DumpJob *)calloc(1, sizeof(*job));
+    if (!job) return;
+    job->from_file = 1;
+    strncpy(job->module_name, module_name, sizeof(job->module_name) - 1);
+    {
+        size_t nlen = strlen(name) + 1;
+        job->chunk_name = (char *)malloc(nlen);
+        if (!job->chunk_name) {
+            free_dump_job(job);
+            return;
         }
-        break;
+        memcpy(job->chunk_name, name, nlen);
     }
-    op = p[i++];
-    if (op == 0x0F) return 0;
-    if ((op >= 0x50 && op <= 0x5F) || op == 0x90 || op == 0xC3) return i;
-    if (op == 0x6A || op == 0xEB) return i + 1;
-    if (op == 0x68 || op == 0xE8 || op == 0xE9) return i + 4;
-    if (op >= 0xB8 && op <= 0xBF) return i + 4;
-    if (op == 0x83) return i + x86_modrm_size(p + i) + 1;
-    if (op == 0x8B || op == 0x89 || op == 0x8D || op == 0x85 || op == 0x33 ||
-        op == 0x3B || op == 0x01 || op == 0x29 || op == 0x39) {
-        n = x86_modrm_size(p + i);
-        if (n <= 0) return 0;
-        return i + n;
+
+    EnterCriticalSection(&g_dump_lock);
+    if (dump_seen_contains(module_name) || g_dump_q_count >= DUMP_QUEUE_CAP) {
+        LeaveCriticalSection(&g_dump_lock);
+        free_dump_job(job);
+        return;
     }
-    return 0;
+    dump_seen_add(module_name);
+    g_dump_queue[g_dump_q_tail] = job;
+    g_dump_q_tail = (g_dump_q_tail + 1) % DUMP_QUEUE_CAP;
+    g_dump_q_count++;
+    LeaveCriticalSection(&g_dump_lock);
+    SetEvent(g_dump_event);
 }
 
-static int measure_stolen(const uint8_t *p, int cap) {
-    int stolen = 0;
-    while (stolen < 5) {
-        int n = x86_insn_len(p + stolen);
-        if (n <= 0 || stolen + n > cap) return 0;
-        stolen += n;
-    }
-    return stolen;
-}
+/* ---- prologue hook helpers (shared decoder in common/x86_insn.h) ---- */
 
 static int install_cdecl_hook(uint8_t *target, void *hook_fn, void **out_tramp,
                               uint8_t *stolen_bytes, int *stolen_n) {
@@ -705,11 +745,14 @@ static int install_cdecl_hook(uint8_t *target, void *hook_fn, void **out_tramp,
     int32_t rel;
     int i;
     if (!target || !hook_fn || !out_tramp) return 0;
-    stolen = measure_stolen(target, 16);
+    stolen = x86_measure_stolen(target, 16);
     if (stolen < 5) return 0;
     tramp = (uint8_t *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tramp) return 0;
-    memcpy(tramp, target, stolen);
+    if (x86_reloc_copy(tramp, target, stolen, target, tramp) != stolen) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        return 0;
+    }
     tramp[stolen] = 0xE9;
     rel = (int32_t)((target + stolen) - (tramp + stolen + 5));
     memcpy(tramp + stolen + 1, &rel, 4);
@@ -719,10 +762,13 @@ static int install_cdecl_hook(uint8_t *target, void *hook_fn, void **out_tramp,
         VirtualFree(tramp, 0, MEM_RELEASE);
         return 0;
     }
+    /* No other thread may execute the target while the jmp is written. */
+    patch_freeze_begin();
     target[0] = 0xE9;
     rel = (int32_t)((uint8_t *)hook_fn - (target + 5));
     memcpy(target + 1, &rel, 4);
     for (i = 5; i < stolen; i++) target[i] = 0x90;
+    patch_freeze_end();
     VirtualProtect(target, stolen, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), target, stolen);
     FlushInstructionCache(GetCurrentProcess(), tramp, 64);
@@ -737,26 +783,8 @@ static int __cdecl hook_loadbuffer(lua_State *L, const char *buff, size_t size, 
 }
 
 static int __cdecl hook_loadfile(lua_State *L, const char *filename) {
-    if (filename && filename[0]) {
-        FILE *fp = fopen(filename, "rb");
-        if (fp) {
-            long sz;
-            char *buf;
-            if (fseek(fp, 0, SEEK_END) == 0) {
-                sz = ftell(fp);
-                if (sz > 0 && sz < 32 * 1024 * 1024) {
-                    buf = (char *)malloc((size_t)sz);
-                    if (buf) {
-                        fseek(fp, 0, SEEK_SET);
-                        if (fread(buf, 1, (size_t)sz, fp) == (size_t)sz)
-                            dump_chunk(buf, (size_t)sz, filename);
-                        free(buf);
-                    }
-                }
-            }
-            fclose(fp);
-        }
-    }
+    if (filename && filename[0])
+        enqueue_dump_file(filename);
     return g_loadfile_orig(L, filename);
 }
 

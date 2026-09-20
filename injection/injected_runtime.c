@@ -19,6 +19,8 @@
 #include "luac_dump.h"
 #include "lua_profiler.h"
 #include "lua_api_hooks.h"
+#include "x86_insn.h"
+#include "patch_freeze.h"
 
 typedef int (__cdecl *lua_pcall_fn)(lua_State*, int, int, int);
 typedef int (__cdecl *luaL_loadstring_fn)(lua_State*, const char*);
@@ -231,96 +233,6 @@ static uint32_t __attribute__((cdecl)) cpp_hook_end(int id) {
     return ret;
 }
 
-static int x86_modrm_size(const uint8_t *p) {
-    uint8_t modrm = p[0];
-    int mod = modrm >> 6;
-    int rm = modrm & 7;
-    int n = 1;
-    if (mod == 3) return 1;
-    if (rm == 4) {
-        n++;
-        if (mod == 0 && (p[1] & 7) == 5) n += 4;
-    } else if (mod == 0 && rm == 5) {
-        n += 4;
-    }
-    if (mod == 1) n += 1;
-    else if (mod == 2) n += 4;
-    return n;
-}
-
-static int x86_insn_len(const uint8_t *p) {
-    int i = 0, n;
-    uint8_t op;
-    while (i < 4) {
-        uint8_t b = p[i];
-        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
-            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) {
-            i++;
-            continue;
-        }
-        break;
-    }
-    op = p[i++];
-    if (op == 0x0F) {
-        uint8_t op2;
-        if (i >= 16) return 0;
-        op2 = p[i++];
-        if (op2 == 0x1F || op2 == 0xAE || op2 == 0x18 ||
-            op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29 ||
-            op2 == 0x2E || op2 == 0x2F || op2 == 0x57 || op2 == 0x58 ||
-            op2 == 0x59 || op2 == 0x5E || op2 == 0x6F || op2 == 0x7F) {
-            n = x86_modrm_size(p + i);
-            if (n <= 0) return 0;
-            return i + n;
-        }
-        return 0;
-    }
-    if ((op >= 0x50 && op <= 0x5F) || op == 0x90 || op == 0xC3) return i;
-    if (op == 0x6A || op == 0xEB) return i + 1;
-    if (op == 0x68 || op == 0xE8 || op == 0xE9) return i + 4;
-    if (op >= 0xB8 && op <= 0xBF) return i + 4;
-    if (op == 0xC2) return i + 2;
-    if (op == 0x83) return i + x86_modrm_size(p + i) + 1;
-    if (op == 0x81) return i + x86_modrm_size(p + i) + 4;
-    if (op == 0x8B || op == 0x89 || op == 0x8D || op == 0x85 || op == 0x33 ||
-        op == 0x3B || op == 0x01 || op == 0x29 || op == 0x39 || op == 0xFF) {
-        n = x86_modrm_size(p + i);
-        if (n <= 0) return 0;
-        return i + n;
-    }
-    return 0;
-}
-
-static int measure_stolen(const uint8_t *p, int cap) {
-    int stolen = 0;
-    while (stolen < 5) {
-        int n = x86_insn_len(p + stolen);
-        if (n <= 0 || stolen + n > cap) return 0;
-        stolen += n;
-    }
-    return stolen;
-}
-
-static int copy_reloc_insns(uint8_t *dst, const uint8_t *src, int stolen,
-    uint8_t *src_va, uint8_t *dst_va) {
-    int off = 0;
-    while (off < stolen) {
-        int n = x86_insn_len(src + off);
-        uint8_t op;
-        if (n <= 0) return 0;
-        memcpy(dst + off, src + off, n);
-        op = src[off];
-        if (op == 0xE8 || op == 0xE9) {
-            int32_t oldrel = *(int32_t *)(src + off + 1);
-            uint32_t tgt = (uint32_t)(uintptr_t)(src_va + off + 5) + oldrel;
-            int32_t newrel = (int32_t)(tgt - ((uint32_t)(uintptr_t)(dst_va + off + 5)));
-            memcpy(dst + off + 1, &newrel, 4);
-        }
-        off += n;
-    }
-    return stolen;
-}
-
 static int build_cpp_hook_stub(CppHook *h, int id, uint32_t resume_addr) {
     uint8_t *s;
     uint32_t begin_addr = (uint32_t)(uintptr_t)cpp_hook_begin;
@@ -381,12 +293,12 @@ static int install_prologue_hook(CppHook *h, int id) {
     int stolen, i;
     int32_t rel;
 
-    stolen = measure_stolen(orig, 16);
+    stolen = x86_measure_stolen(orig, 16);
     if (stolen < 5) return 0;
     h->stub = VirtualAlloc(NULL, 256, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!h->stub) return 0;
     tramp = (uint8_t *)h->stub + 128;
-    if (copy_reloc_insns(tramp, orig, stolen, orig, tramp) != stolen) {
+    if (x86_reloc_copy(tramp, orig, stolen, orig, tramp) != stolen) {
         VirtualFree(h->stub, 0, MEM_RELEASE);
         h->stub = NULL;
         return 0;
@@ -407,10 +319,13 @@ static int install_prologue_hook(CppHook *h, int id) {
         h->stub = NULL;
         return 0;
     }
+    /* No other thread may execute the target while the jmp is written. */
+    patch_freeze_begin();
     orig[0] = 0xE9;
     rel = (int32_t)((uint8_t *)h->stub - (orig + 5));
     memcpy(orig + 1, &rel, 4);
     for (i = 5; i < stolen; i++) orig[i] = 0x90;
+    patch_freeze_end();
     VirtualProtect(orig, stolen, old_protect, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), orig, stolen);
     FlushInstructionCache(GetCurrentProcess(), h->stub, 256);
@@ -454,6 +369,9 @@ static int install_one_cpp_hook(CppHook *h, int id) {
     if (h->site_count <= 0) return 0;
     if (!build_cpp_hook_stub(h, id, h->orig)) return 0;
 
+    /* Freeze once around all call-site patches so no thread executes a
+       half-written call. */
+    patch_freeze_begin();
     for (i = 0; i < h->site_count; i++) {
         uint8_t *target = h->sites[i];
         int32_t rel;
@@ -464,9 +382,11 @@ static int install_one_cpp_hook(CppHook *h, int id) {
         target[0] = 0xE8;
         memcpy(target + 1, &rel, 4);
         VirtualProtect(target, CPP_PATCH_LEN, old_protect, &old_protect);
-        FlushInstructionCache(GetCurrentProcess(), target, CPP_PATCH_LEN);
         patched++;
     }
+    patch_freeze_end();
+    for (i = 0; i < h->site_count; i++)
+        FlushInstructionCache(GetCurrentProcess(), h->sites[i], CPP_PATCH_LEN);
     FlushInstructionCache(GetCurrentProcess(), h->stub, 256);
     if (!patched) {
         VirtualFree(h->stub, 0, MEM_RELEASE);
@@ -603,6 +523,7 @@ static void publish_precise_frame(const CocosDebugLuaProfilerFrame *frame) {
     out->lua_cpu_ms = (float)frame->lua_cpu_ms;
     out->lua_script_self_ms = (float)frame->lua_script_self_ms;
     out->lua_c_self_ms = (float)frame->lua_c_self_ms;
+    out->lua_outside_ms = (float)frame->lua_outside_ms;
     out->lua_mem_kb = (float)query_lua_mem_kb();
     out->hook_events = frame->hook_events;
     out->flags = frame->flags;
@@ -1386,10 +1307,20 @@ static DWORD WINAPI thread(LPVOID u) {
     }
     api_hook_flags = cocos_debug_lua_api_hooks_install(
         (void *)resolve_proc("lua_resume"),
-        (void *)resolve_proc("lua_newthread"));
+        (void *)resolve_proc("lua_newthread"),
+        (void *)g_PC);
     if ((api_hook_flags & 1) == 0) {
         cocos_debug_telemetry_set_state(
             COCOS_DEBUG_IPC_STATE_ERROR, "lua_resume hook install failed");
+        return 1;
+    }
+    if ((api_hook_flags & 4) == 0) {
+        /* Without it every error caught by pcall leaves the profiler's shadow
+           stack permanently one shift too deep, which silently corrupts all
+           later inclusive times for that Lua thread.  Refuse to report data
+           that would be wrong rather than degrade quietly. */
+        cocos_debug_telemetry_set_state(
+            COCOS_DEBUG_IPC_STATE_ERROR, "lua_pcall hook install failed");
         return 1;
     }
     cocos_debug_luac_dump_init(config->luac_dump_dir);

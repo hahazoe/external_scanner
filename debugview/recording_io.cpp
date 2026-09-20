@@ -10,7 +10,11 @@
 #include "recording_io.h"
 
 static const char kMagic[8] = {'C', 'C', 'D', 'B', 'R', 'E', 'C', '1'};
-static const uint32_t kVersion = 5;
+/* 5: first shipped layout.
+   6: adds FrameSnapshot.lua_outside_ms and LuaLineSnapshot.line_ms (v6 files
+      are read by v6 readers; v5 files still load, with both fields 0). */
+static const uint32_t kVersion = 6;
+static const uint32_t kMinSupportedVersion = 5;
 
 static bool write_raw(FILE *fp, const void *data, size_t size) {
     return fwrite(data, 1, size, fp) == size;
@@ -117,6 +121,7 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     if (!write_f32(fp, frame.lua_cpu_ms)) return false;
     if (!write_f32(fp, frame.lua_script_self_ms)) return false;
     if (!write_f32(fp, frame.lua_c_self_ms)) return false;
+    if (!write_f32(fp, frame.lua_outside_ms)) return false;
     if (!write_f32(fp, frame.lua_mem_kb)) return false;
     if (!write_u32(fp, frame.hook_events)) return false;
     if (!write_u32(fp, frame.flags)) return false;
@@ -126,7 +131,7 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     if (!write_u32(fp, event_count)) return false;
     for (i = 0; i < lua_count; i++) {
         const LuaMethodSnapshot &m = frame.lua_methods[i];
-        if (!write_string(fp, m.name)) return false;
+        if (!write_string(fp, cocos_debug_snapshot_text(m.name))) return false;
         if (!write_u32(fp, m.kind)) return false;
         if (!write_u32(fp, m.flags)) return false;
         if (!write_f32(fp, m.self_ms)) return false;
@@ -139,7 +144,7 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     }
     for (i = 0; i < cpp_count; i++) {
         const CppMethodSnapshot &m = frame.cpp_methods[i];
-        if (!write_string(fp, m.name)) return false;
+        if (!write_string(fp, cocos_debug_snapshot_text(m.name))) return false;
         if (!write_f32(fp, m.total_ms)) return false;
         if (!write_f32(fp, m.max_ms)) return false;
         if (!write_f32(fp, m.last_ms)) return false;
@@ -148,10 +153,11 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     }
     for (i = 0; i < line_count; i++) {
         const LuaLineSnapshot &m = frame.lua_lines[i];
-        if (!write_string(fp, m.source)) return false;
-        if (!write_string(fp, m.function_name)) return false;
+        if (!write_string(fp, cocos_debug_snapshot_text(m.source))) return false;
+        if (!write_string(fp, cocos_debug_snapshot_text(m.function_name))) return false;
         if (!write_u32(fp, (uint32_t)m.line)) return false;
         if (!write_u32(fp, m.samples)) return false;
+        if (!write_f32(fp, m.line_ms)) return false;
     }
     for (i = 0; i < event_count; i++) {
         const LuaTraceEventSnapshot &event = frame.trace_events[i];
@@ -162,7 +168,7 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
         if (!write_u32(fp, event.lua_thread_id)) return false;
         if (!write_u32(fp, event.os_thread_id)) return false;
         if (!write_u32(fp, event.method_id)) return false;
-        if (!write_string(fp, event.method_name)) return false;
+        if (!write_string(fp, cocos_debug_snapshot_text(event.method_name))) return false;
         if (!write_u32(fp, (uint32_t)(int32_t)event.depth)) return false;
         if (!write_u32(fp, event.type)) return false;
         if (!write_u32(fp, event.flags)) return false;
@@ -170,7 +176,7 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     return true;
 }
 
-static bool read_frame(FILE *fp, FrameSnapshot *frame) {
+static bool read_frame(FILE *fp, FrameSnapshot *frame, uint32_t version) {
     uint32_t i;
     uint32_t lua_count = 0;
     uint32_t cpp_count = 0;
@@ -187,6 +193,8 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame) {
     if (!read_f32(fp, &frame->lua_cpu_ms)) return false;
     if (!read_f32(fp, &frame->lua_script_self_ms)) return false;
     if (!read_f32(fp, &frame->lua_c_self_ms)) return false;
+    frame->lua_outside_ms = 0.0f;
+    if (version >= 6 && !read_f32(fp, &frame->lua_outside_ms)) return false;
     if (!read_f32(fp, &frame->lua_mem_kb)) return false;
     if (!read_u32(fp, &frame->hook_events)) return false;
     if (!read_u32(fp, &frame->flags)) return false;
@@ -206,9 +214,11 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame) {
     frame->trace_events.reserve(event_count);
     for (i = 0; i < lua_count; i++) {
         LuaMethodSnapshot m;
+        std::string name;
         uint32_t kind;
         uint32_t flags;
-        if (!read_string(fp, &m.name)) return false;
+        if (!read_string(fp, &name)) return false;
+        m.name = cocos_debug_pool_intern(name);
         if (!read_u32(fp, &kind)) return false;
         if (!read_u32(fp, &flags)) return false;
         m.kind = (uint16_t)kind;
@@ -224,7 +234,9 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame) {
     }
     for (i = 0; i < cpp_count; i++) {
         CppMethodSnapshot m;
-        if (!read_string(fp, &m.name)) return false;
+        std::string name;
+        if (!read_string(fp, &name)) return false;
+        m.name = cocos_debug_pool_intern(name);
         if (!read_f32(fp, &m.total_ms)) return false;
         if (!read_f32(fp, &m.max_ms)) return false;
         if (!read_f32(fp, &m.last_ms)) return false;
@@ -234,11 +246,17 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame) {
     }
     for (i = 0; i < line_count; i++) {
         LuaLineSnapshot m;
+        std::string source;
+        std::string function_name;
         uint32_t line;
-        if (!read_string(fp, &m.source)) return false;
-        if (!read_string(fp, &m.function_name)) return false;
+        if (!read_string(fp, &source)) return false;
+        if (!read_string(fp, &function_name)) return false;
+        m.source = cocos_debug_pool_intern(source);
+        m.function_name = cocos_debug_pool_intern(function_name);
         if (!read_u32(fp, &line)) return false;
         if (!read_u32(fp, &m.samples)) return false;
+        m.line_ms = 0.0f;
+        if (version >= 6 && !read_f32(fp, &m.line_ms)) return false;
         m.line = (int32_t)line;
         frame->lua_lines.push_back(m);
     }
@@ -254,7 +272,11 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame) {
         if (!read_u32(fp, &event.lua_thread_id)) return false;
         if (!read_u32(fp, &event.os_thread_id)) return false;
         if (!read_u32(fp, &event.method_id)) return false;
-        if (!read_string(fp, &event.method_name)) return false;
+        {
+            std::string method_name;
+            if (!read_string(fp, &method_name)) return false;
+            event.method_name = cocos_debug_pool_intern(method_name);
+        }
         if (!read_u32(fp, &depth)) return false;
         if (!read_u32(fp, &type)) return false;
         if (!read_u32(fp, &flags)) return false;
@@ -377,7 +399,8 @@ bool cocos_debug_load_recording(const char *path, std::deque<FrameSnapshot> *fra
         if (error) *error = "bad recording magic";
         return false;
     }
-    if (!read_u32(fp, &version) || version != kVersion) {
+    if (!read_u32(fp, &version) || version < kMinSupportedVersion ||
+        version > kVersion) {
         fclose(fp);
         if (error) *error = "unsupported recording version";
         return false;
@@ -389,7 +412,7 @@ bool cocos_debug_load_recording(const char *path, std::deque<FrameSnapshot> *fra
     }
     for (i = 0; i < count; i++) {
         FrameSnapshot frame;
-        if (!read_frame(fp, &frame)) {
+        if (!read_frame(fp, &frame, version)) {
             fclose(fp);
             if (error) *error = "failed to read frame data";
             return false;

@@ -49,10 +49,10 @@ flowchart LR
 
 | 路径 | 作用 |
 |------|------|
-| [`common/`](common/) | IPC 共享内存布局（viewer 与 DLL 共用） |
-| [`injection/`](injection/) | 进程扫描、注入、目标进程内 profiler |
+| [`common/`](common/) | IPC 共享内存布局（viewer 与 DLL 共用）、共享 x86 指令解码 [`common/x86_insn.h`](common/x86_insn.h) |
+| [`injection/`](injection/) | 进程扫描、注入、目标进程内 profiler；[`injection/patch_freeze.h`](injection/patch_freeze.h) 在打补丁时冻结其他线程 |
 | [`injection/scripts/`](injection/scripts/) | 嵌入的 bootstrap / coroutine 发现脚本 |
-| [`debugview/`](debugview/) | Win32 + Dear ImGui + ImPlot 界面 |
+| [`debugview/`](debugview/) | Win32 + Dear ImGui + ImPlot 界面；[`debugview/name_pool.cpp`](debugview/name_pool.cpp) 是帧快照的全局字符串池 |
 | [`tests/`](tests/) | IPC、profiler 内核、Lua 5.1、录制格式测试 |
 | [`third_party/imgui`](third_party/imgui)、[`third_party/implot`](third_party/implot) | UI 依赖 |
 | [`build.bat`](build.bat) | 32 位 MinGW 构建入口 |

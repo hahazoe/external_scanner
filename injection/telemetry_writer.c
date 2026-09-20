@@ -116,22 +116,36 @@ int cocos_debug_telemetry_viewer_alive(void) {
 }
 
 uint32_t cocos_debug_telemetry_intern_method(const char *key) {
+    char bounded[COCOS_DEBUG_IPC_METHOD_KEY];
+    const char *name;
     uint32_t hash, start, i;
     if (!g_block || !key || !key[0]) return 0;
-    hash = hash_key(key);
+    /* Truncate before hashing, not after.  The stored copy is only
+       COCOS_DEBUG_IPC_METHOD_KEY bytes, so a longer key hashed over its full
+       length could never compare equal to that copy: every call with such a
+       key allocated a fresh dictionary slot.  The dictionary is process
+       global and never cleared, so 4096 of those and every later method gets
+       method_id 0 -- its time then only shows up in the lua_cpu total and
+       disappears from the method table.  Line sampling is what produced
+       over-long keys, by interning whole chunk sources. */
+    strncpy(bounded, key, sizeof(bounded) - 1);
+    bounded[sizeof(bounded) - 1] = 0;
+    name = bounded;
+    hash = hash_key(name);
     start = hash % COCOS_DEBUG_IPC_METHOD_DICT_CAP;
     for (i = 0; i < COCOS_DEBUG_IPC_METHOD_DICT_CAP; i++) {
         uint32_t slot = (start + i) % COCOS_DEBUG_IPC_METHOD_DICT_CAP;
         CocosDebugIpcMethodDictionaryEntry *entry = &g_block->dictionary[slot];
         if (entry->method_id != 0) {
-            if (entry->hash == hash && strncmp(entry->key, key, COCOS_DEBUG_IPC_METHOD_KEY) == 0)
+            if (entry->hash == hash &&
+                strncmp(entry->key, name, COCOS_DEBUG_IPC_METHOD_KEY) == 0)
                 return entry->method_id;
             continue;
         }
         InterlockedIncrement((LONG *)&entry->sequence);
         entry->method_id = slot + 1;
         entry->hash = hash;
-        strncpy(entry->key, key, COCOS_DEBUG_IPC_METHOD_KEY - 1);
+        strncpy(entry->key, name, COCOS_DEBUG_IPC_METHOD_KEY - 1);
         entry->key[COCOS_DEBUG_IPC_METHOD_KEY - 1] = 0;
         MemoryBarrier();
         InterlockedIncrement((LONG *)&entry->sequence);

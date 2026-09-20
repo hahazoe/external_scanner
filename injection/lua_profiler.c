@@ -11,11 +11,13 @@
 #define LP_METHOD_META_CAP COCOS_DEBUG_IPC_METHOD_DICT_CAP
 #define LP_METHOD_HASH_CAP 8192
 #define LP_LOCAL_ACC_CAP 512
+#define LP_LOCAL_ACC_HASH 1024
 #define LP_LOCAL_INTERVAL_CAP 4096
 #define LP_LOCAL_LINE_CAP 64
 #define LP_NAME_CACHE_CAP 1024
 #define LP_NAME_CACHE_HASH 2048
 #define LP_LINE_HASH_CAP 128
+#define LP_PCALL_CAP 32
 
 typedef struct LpStackEntry {
     uint32_t method_id;
@@ -43,6 +45,12 @@ typedef struct LpLineAcc {
     uint32_t function_id;
     int32_t line;
     uint32_t samples;
+    /* Wall time spent on this line: every slice accounted while this entry
+       was the thread's open line.  This is what turns the line view from an
+       instruction-count histogram into a time profile, and it is the only
+       way a line whose whole cost is a C call (instruction counter frozen)
+       ever shows up. */
+    uint64_t qpc;
 } LpLineAcc;
 
 typedef struct LpInterval {
@@ -55,7 +63,14 @@ typedef struct LpThreadStorage {
     LpInterval intervals[LP_LOCAL_INTERVAL_CAP];
     LpLineAcc lines[LP_LOCAL_LINE_CAP];
     uint16_t line_hash[LP_LINE_HASH_CAP];
+    uint16_t acc_hash[LP_LOCAL_ACC_HASH]; /* method_id -> acc index + 1 */
 } LpThreadStorage;
+
+typedef struct LpPcallBase {
+    uint32_t token;
+    int32_t stack_top;
+    int32_t overflow_depth;
+} LpPcallBase;
 
 typedef struct LpThread {
     lua_State *L;
@@ -73,10 +88,21 @@ typedef struct LpThread {
     uint64_t cpu_qpc;
     uint64_t script_qpc;
     uint64_t c_qpc;
+    /* Lua time spent while no frame window was open (between frame_end and
+       the next frame_begin).  Kept out of cpu_qpc/script_qpc/c_qpc and out
+       of every method accumulator on purpose: the window owns those, and
+       mixing the two would break sum(method self) == lua_cpu. */
+    uint64_t outside_qpc;
+    uint64_t outside_last_qpc;
+    /* Thread's currently executing line (index into storage->lines + 1);
+       0 when line capture is off or nothing has been sampled yet. */
+    uint32_t open_line;
     uint32_t hook_events;
     uint32_t acc_count;
     uint32_t interval_count;
     uint32_t line_count;
+    int pcall_depth;
+    LpPcallBase pcall_base[LP_PCALL_CAP];
     CRITICAL_SECTION lock;
     int lock_ready;
     LpThreadStorage *storage;
@@ -98,6 +124,10 @@ typedef struct LpNameCache {
     uint32_t method_id;
     uint16_t kind;
     uint16_t flags;
+    /* Content fingerprints: a recycled TString address must not produce a
+       false hit after the old string is garbage-collected. */
+    char source_head[16];
+    char name_head[16];
 } LpNameCache;
 
 typedef struct LpFrameState {
@@ -128,11 +158,26 @@ static LpMethodMeta g_method_meta[LP_METHOD_META_CAP];
 static uint16_t g_method_hash[LP_METHOD_HASH_CAP];
 static uint32_t g_method_meta_count;
 
+/* Handed out to each protected call so its leave can prove the depth it
+   recorded is still the one on top (the shadow stacks can be wiped wholesale
+   between enter and leave, e.g. by a viewer restart command). */
+static uint32_t g_pcall_token = 1u;
+
 static LpNameCache g_name_cache[LP_NAME_CACHE_CAP];
 static uint16_t g_name_cache_hash[LP_NAME_CACHE_HASH];
 static uint32_t g_name_cache_count;
 
 static LpFrameState g_frame;
+
+/* Outside-window Lua time collected during the gap that led into the frame
+   currently being recorded.  frame_begin harvests it, frame_end publishes it:
+   the gap after frame N belongs to frame N+1, which is the frame that pays
+   for it. */
+static uint64_t g_pending_outside_qpc;
+
+/* method_id -> out->methods index + 1, valid during frame_end merge only
+   (frame_end holds g_lock). Avoids the O(accs x out_methods) linear merge. */
+static uint16_t g_merge_method_slot[COCOS_DEBUG_IPC_METHOD_DICT_CAP + 1];
 
 static uint64_t lp_now(void) {
     LARGE_INTEGER qpc;
@@ -256,8 +301,22 @@ static LpThread *lp_add_thread_locked(lua_State *L) {
     return NULL;
 }
 
+/* An anonymous C function (lua_pushcclosure of a C function Lua never gave a
+   name to -- for iterators, `for ... in` generators, and every tolua-bound
+   binding reached through a table) is reported as "<anonymous>" no matter who
+   called it.  With 600+ hits a frame that single bucket was the largest C
+   cost in the profile and completely unactionable, so its key is qualified
+   with the calling method id: the cost lands on the Lua function that drove
+   it, which is the one you can actually go edit. */
+static int lp_is_anonymous_c(lua_Debug *ar) {
+    const char *what = ar && ar->what ? ar->what : "Lua";
+    if (strcmp(what, "C") != 0) return 0;
+    return !ar->name || !ar->name[0] || strcmp(ar->name, "?") == 0;
+}
+
 static void lp_make_method_key(lua_Debug *ar, char *out, size_t cap,
-                               uint16_t *kind, uint16_t *flags) {
+                               uint16_t *kind, uint16_t *flags,
+                               uint32_t caller_method_id) {
     const char *source = ar && ar->short_src ? ar->short_src : "?";
     const char *name = ar && ar->name ? ar->name : "<anonymous>";
     const char *what = ar && ar->what ? ar->what : "Lua";
@@ -265,7 +324,10 @@ static void lp_make_method_key(lua_Debug *ar, char *out, size_t cap,
         ? COCOS_DEBUG_IPC_LUA_METHOD_INTERNAL : 0u;
     if (strcmp(what, "C") == 0) {
         *kind = COCOS_DEBUG_IPC_LUA_METHOD_C;
-        _snprintf(out, cap, "[C]:%s", name);
+        if (lp_is_anonymous_c(ar) && caller_method_id)
+            _snprintf(out, cap, "[C]:<anonymous>@%u", caller_method_id);
+        else
+            _snprintf(out, cap, "[C]:%s", name);
         return;
     }
     *kind = strcmp(what, "main") == 0
@@ -273,6 +335,16 @@ static void lp_make_method_key(lua_Debug *ar, char *out, size_t cap,
     if (source[0] == '@') source++;
     _snprintf(out, cap, "%s:%d:%s:%s",
               source, ar ? ar->linedefined : 0, what, name);
+}
+
+static void lp_copy_head(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    if (!dst || cap == 0) return;
+    if (src) {
+        for (; i + 1 < cap && src[i]; i++)
+            dst[i] = src[i];
+    }
+    dst[i] = 0;
 }
 
 static int lp_name_cache_lookup(lua_Debug *ar, uint32_t *method_id,
@@ -298,6 +370,13 @@ static int lp_name_cache_lookup(lua_Debug *ar, uint32_t *method_id,
         entry = &g_name_cache[value - 1];
         if (entry->source == source && entry->name == name &&
             entry->linedefined == ar->linedefined && entry->what0 == what0) {
+            char source_head[16];
+            char name_head[16];
+            lp_copy_head(source_head, sizeof(source_head), (const char *)source);
+            lp_copy_head(name_head, sizeof(name_head), (const char *)name);
+            if (strcmp(entry->source_head, source_head) != 0 ||
+                strcmp(entry->name_head, name_head) != 0)
+                continue;
             *method_id = entry->method_id;
             *kind = entry->kind;
             *flags = entry->flags;
@@ -329,6 +408,10 @@ static void lp_name_cache_store(lua_Debug *ar, uint32_t method_id,
             entry->method_id = method_id;
             entry->kind = kind;
             entry->flags = flags;
+            lp_copy_head(entry->source_head, sizeof(entry->source_head),
+                         (const char *)ar->source);
+            lp_copy_head(entry->name_head, sizeof(entry->name_head),
+                         (const char *)ar->name);
             g_name_cache_hash[slot] = (uint16_t)(g_name_cache_count + 1);
             g_name_cache_count++;
         }
@@ -337,15 +420,20 @@ static void lp_name_cache_store(lua_Debug *ar, uint32_t method_id,
 }
 
 static uint32_t lp_method_id_locked(lua_Debug *ar, uint16_t *kind,
-                                    uint16_t *flags) {
+                                    uint16_t *flags,
+                                    uint32_t caller_method_id) {
     char key[COCOS_DEBUG_IPC_METHOD_KEY];
     uint32_t hash;
     uint32_t start;
     uint32_t i;
     uint32_t cached_id = 0;
-    if (lp_name_cache_lookup(ar, &cached_id, kind, flags))
+    /* The name cache keys on (source, name, linedefined, what) -- it cannot
+       tell two anonymous C calls from different call sites apart, and would
+       happily hand the first one's id to all of them. */
+    int anon_c = lp_is_anonymous_c(ar);
+    if (!anon_c && lp_name_cache_lookup(ar, &cached_id, kind, flags))
         return cached_id;
-    lp_make_method_key(ar, key, sizeof(key), kind, flags);
+    lp_make_method_key(ar, key, sizeof(key), kind, flags, caller_method_id);
     key[sizeof(key) - 1] = 0;
     hash = lp_hash_bytes(key);
     start = hash % LP_METHOD_HASH_CAP;
@@ -358,7 +446,9 @@ static uint32_t lp_method_id_locked(lua_Debug *ar, uint16_t *kind,
                 strncmp(meta->key, key, sizeof(meta->key)) == 0) {
                 *kind = meta->kind;
                 *flags = meta->flags;
-                lp_name_cache_store(ar, meta->method_id, meta->kind, meta->flags);
+                if (!anon_c)
+                    lp_name_cache_store(ar, meta->method_id, meta->kind,
+                                        meta->flags);
                 return meta->method_id;
             }
             continue;
@@ -383,7 +473,9 @@ static uint32_t lp_method_id_locked(lua_Debug *ar, uint16_t *kind,
             }
             g_method_hash[slot] = (uint16_t)(g_method_meta_count + 1);
             g_method_meta_count++;
-            lp_name_cache_store(ar, meta->method_id, meta->kind, meta->flags);
+            if (!anon_c)
+                lp_name_cache_store(ar, meta->method_id, meta->kind,
+                                    meta->flags);
             return meta->method_id;
         }
     }
@@ -393,12 +485,18 @@ static uint32_t lp_method_id_locked(lua_Debug *ar, uint16_t *kind,
 
 static LpLocalAcc *lp_touch_local(LpThread *thread, uint32_t method_id,
                                   uint16_t kind, uint16_t flags) {
+    uint32_t start;
     uint32_t i;
     LpLocalAcc *acc;
     if (!thread || !thread->storage || !method_id) return NULL;
-    for (i = 0; i < thread->acc_count; i++) {
-        if (thread->storage->accs[i].method_id == method_id)
-            return &thread->storage->accs[i];
+    /* method_id is dense (1..dict cap): multiply-shift spreads it evenly. */
+    start = (method_id * 2654435761u) >> 22;
+    for (i = 0; i < LP_LOCAL_ACC_HASH; i++) {
+        uint32_t slot = (start + i) & (LP_LOCAL_ACC_HASH - 1);
+        uint16_t value = thread->storage->acc_hash[slot];
+        if (!value) break;
+        if (thread->storage->accs[value - 1].method_id == method_id)
+            return &thread->storage->accs[value - 1];
     }
     if (thread->acc_count >= LP_LOCAL_ACC_CAP) {
         lp_or_flag(COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED);
@@ -409,7 +507,64 @@ static LpLocalAcc *lp_touch_local(LpThread *thread, uint32_t method_id,
     acc->method_id = method_id;
     acc->kind = kind;
     acc->flags = flags;
+    for (i = 0; i < LP_LOCAL_ACC_HASH; i++) {
+        uint32_t slot = (start + i) & (LP_LOCAL_ACC_HASH - 1);
+        if (!thread->storage->acc_hash[slot]) {
+            thread->storage->acc_hash[slot] = (uint16_t)thread->acc_count;
+            break;
+        }
+    }
     return acc;
+}
+
+/* Lookup only: never allocates an accumulator for a frame we are discarding. */
+static LpLocalAcc *lp_find_local_locked(LpThread *thread, uint32_t method_id) {
+    uint32_t start;
+    uint32_t i;
+    if (!thread || !thread->storage || !method_id) return NULL;
+    start = (method_id * 2654435761u) >> 22;
+    for (i = 0; i < LP_LOCAL_ACC_HASH; i++) {
+        uint32_t slot = (start + i) & (LP_LOCAL_ACC_HASH - 1);
+        uint16_t value = thread->storage->acc_hash[slot];
+        if (!value) return NULL;
+        if (thread->storage->accs[value - 1].method_id == method_id)
+            return &thread->storage->accs[value - 1];
+    }
+    return NULL;
+}
+
+/* Discard shadow frames Lua has already dropped without emitting RET hooks.
+   Frames can only ever pile up on top of the real ones, so truncating to the
+   depth recorded at the protected-call boundary restores exact alignment.
+
+   The outermost discarded frame keeps its own self time -- it really was on
+   the stack -- and the frames nested inside it are re-attributed to it, so
+   no measured time disappears and the per-method self times still add up to
+   the frame's lua_cpu.  (Its inclusive time is simply never emitted: the
+   call never returned.) */
+static void lp_drop_frames_locked(LpThread *thread, int target_top) {
+    int old_top;
+    int k;
+    LpLocalAcc *keep_acc;
+    if (!thread) return;
+    if (target_top < 0) target_top = 0;
+    old_top = thread->stack_top;
+    if (target_top >= old_top) return;
+    keep_acc = lp_find_local_locked(
+        thread, g_stacks[thread->id - 1][target_top].method_id);
+    for (k = target_top + 1; k < old_top; k++) {
+        LpStackEntry *inner = &g_stacks[thread->id - 1][k];
+        LpLocalAcc *acc;
+        if (!inner->frame_self_qpc) continue;
+        acc = lp_find_local_locked(thread, inner->method_id);
+        if (acc)
+            acc->self_qpc = acc->self_qpc >= inner->frame_self_qpc
+                ? acc->self_qpc - inner->frame_self_qpc : 0;
+        if (keep_acc) keep_acc->self_qpc += inner->frame_self_qpc;
+    }
+    memset(&g_stacks[thread->id - 1][target_top], 0,
+           (size_t)(old_top - target_top) * sizeof(LpStackEntry));
+    thread->stack_top = target_top;
 }
 
 static void lp_rebuild_stack_locked(LpThread *thread) {
@@ -427,13 +582,18 @@ static void lp_rebuild_stack_locked(LpThread *thread) {
         if (g_api.getstack(thread->L, count, &extra))
             lp_or_flag(COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED);
     }
+    uint32_t caller_method_id = 0;
     for (level = count - 1; level >= 0; level--) {
         uint16_t kind = COCOS_DEBUG_IPC_LUA_METHOD_LUA;
         uint16_t flags = 0;
         uint32_t method_id = 0;
         LpStackEntry *entry;
         if (g_api.getinfo(thread->L, "nS", &frames[level]))
-            method_id = lp_method_id_locked(&frames[level], &kind, &flags);
+            method_id = lp_method_id_locked(&frames[level], &kind, &flags,
+                                            caller_method_id);
+        /* Outermost first, so the frame just built is the caller of the next
+           one -- which is what an anonymous C entry needs to be split by. */
+        caller_method_id = method_id;
         entry = &g_stacks[thread->id - 1][thread->stack_top++];
         memset(entry, 0, sizeof(*entry));
         entry->method_id = method_id;
@@ -477,15 +637,27 @@ static void lp_account_until_locked(LpThread *thread, uint64_t now) {
     uint64_t delta;
     LpStackEntry *top;
     LpLocalAcc *acc;
-    if (!g_frame.active || g_suspend_depth > 0 ||
-        !thread || !thread->running)
+    if (g_suspend_depth > 0 || !thread || !thread->running) return;
+    if (!g_frame.active) {
+        /* Lua running outside the drawScene window.  The per-frame method
+           accumulators are closed, so nothing here can be attributed; it is
+           kept as a thread-level "lost Lua" counter instead of being dropped
+           on the floor the way it used to be. */
+        start = thread->outside_last_qpc;
+        if (!start) start = now;
+        if (now > start) thread->outside_qpc += now - start;
+        thread->outside_last_qpc = now;
         return;
+    }
     start = thread->last_account_qpc
         ? thread->last_account_qpc : g_frame.begin_qpc;
     if (now <= start) return;
     delta = now - start;
     thread->logical_qpc += delta;
     thread->cpu_qpc += delta;
+    if (thread->open_line && thread->storage &&
+        thread->open_line <= LP_LOCAL_LINE_CAP)
+        thread->storage->lines[thread->open_line - 1].qpc += delta;
     top = lp_top_entry(thread);
     if (!top) {
         lp_or_flag(COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED);
@@ -549,8 +721,21 @@ static void lp_sample_line_local(lua_State *L, lua_Debug *ar, LpThread *thread) 
         return;
     source = ar->source && ar->source[0] ? ar->source : ar->short_src;
     if (!source || !source[0] || lp_source_is_internal(source)) return;
-    if (source[0] == '@') source++;
-    source_id = g_api.intern_method ? g_api.intern_method(source) : 0;
+    /* Intern ar->short_src, never the raw chunk.  ar->source is the whole
+       file -- or, for a chunk handed to loadstring, the whole script text --
+       and a key longer than the dictionary's fixed key field could not be
+       matched against its own stored copy, so interning it burned a fresh
+       dictionary slot on *every sample* until the process-global dictionary
+       (4096 entries, never cleared) was full and new methods all got
+       method_id 0.  short_src is capped at LUA_IDSIZE and still names the
+       file well enough for the line view. */
+    {
+        char source_key[COCOS_DEBUG_IPC_METHOD_KEY];
+        _snprintf(source_key, sizeof(source_key), "@src:%s",
+                  ar->short_src[0] ? ar->short_src : source);
+        source_key[sizeof(source_key) - 1] = 0;
+        source_id = g_api.intern_method ? g_api.intern_method(source_key) : 0;
+    }
     top = lp_top_entry(thread);
     if (top) function_id = top->method_id;
     start = lp_line_hash(source_id, function_id, ar->currentline) % LP_LINE_HASH_CAP;
@@ -564,6 +749,11 @@ static void lp_sample_line_local(lua_State *L, lua_Debug *ar, LpThread *thread) 
             line->function_id == function_id &&
             line->line == ar->currentline) {
             line->samples++;
+            /* From here until the next hook event, wall time belongs to this
+               line.  This is what makes a line that spends its whole slice
+               inside a C call show up at all: the instruction counter never
+               ticks there, but the clock does. */
+            thread->open_line = value;
             return;
         }
     }
@@ -575,6 +765,7 @@ static void lp_sample_line_local(lua_State *L, lua_Debug *ar, LpThread *thread) 
     thread->storage->lines[thread->line_count].function_id = function_id;
     thread->storage->lines[thread->line_count].line = ar->currentline;
     thread->storage->lines[thread->line_count].samples = 1;
+    thread->storage->lines[thread->line_count].qpc = 0;
     for (i = 0; i < LP_LINE_HASH_CAP; i++) {
         uint32_t slot = (start + i) % LP_LINE_HASH_CAP;
         if (!thread->storage->line_hash[slot]) {
@@ -582,6 +773,7 @@ static void lp_sample_line_local(lua_State *L, lua_Debug *ar, LpThread *thread) 
             break;
         }
     }
+    thread->open_line = thread->line_count + 1;
     thread->line_count++;
     lp_or_flag(COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED);
 }
@@ -621,8 +813,14 @@ static void lp_profile_hook(lua_State *L, lua_Debug *ar) {
         TlsSetValue(g_tls_guard, NULL);
         return;
     }
-    if (is_call && got_info)
-        event_method = lp_method_id_locked(ar, &kind, &flags);
+    if (is_call && got_info) {
+        /* Qualify an anonymous C callee with whoever is calling it, so the
+           cost lands on the Lua function that drove it. */
+        uint32_t caller_method_id = 0;
+        LpStackEntry *caller_top = lp_top_entry(thread);
+        if (caller_top) caller_method_id = caller_top->method_id;
+        event_method = lp_method_id_locked(ar, &kind, &flags, caller_method_id);
+    }
     LeaveCriticalSection(&g_lock);
 
     EnterCriticalSection(&thread->lock);
@@ -640,6 +838,15 @@ static void lp_profile_hook(lua_State *L, lua_Debug *ar) {
     }
 
     if (is_call) {
+        /* A call that finds the thread idle starts a fresh logical run, so
+           the clock baseline is reset here -- *before* the new frame latches
+           it.  Resetting at the end of the hook (as this used to) left the
+           previous run's accumulated logical time sitting in logical_qpc, so
+           every root call after the first in a frame stored a stale
+           frame_logical_start and its inclusive collapsed to 0 whenever the
+           new run was shorter than the stale value. */
+        if (!was_running && g_frame.active)
+            thread->logical_qpc = 0;
         if (thread->stack_top < COCOS_DEBUG_LUA_PROFILER_STACK_CAP) {
             entry = &g_stacks[thread->id - 1][thread->stack_top++];
             memset(entry, 0, sizeof(*entry));
@@ -705,12 +912,18 @@ static void lp_profile_hook(lua_State *L, lua_Debug *ar) {
         exit_qpc = lp_now();
     else
         exit_qpc = entry_qpc;
-    if (!was_running && thread->running && g_frame.active)
-        thread->logical_qpc = 0;
-    if (thread->running && g_frame.active) {
-        thread->busy_start_qpc = exit_qpc;
-        thread->busy_open = 1;
-        thread->last_account_qpc = exit_qpc;
+    if (thread->running) {
+        if (g_frame.active) {
+            thread->busy_start_qpc = exit_qpc;
+            thread->busy_open = 1;
+            thread->last_account_qpc = exit_qpc;
+            thread->outside_last_qpc = 0;
+        } else {
+            /* Open the outside-window slice here, not at the next event:
+               a thread that was already running when the window closed would
+               otherwise lose the whole gap. */
+            thread->outside_last_qpc = exit_qpc;
+        }
     }
     LeaveCriticalSection(&thread->lock);
     TlsSetValue(g_tls_guard, NULL);
@@ -783,22 +996,23 @@ static double lp_qpc_to_ms(uint64_t value) {
 }
 
 static void lp_merge_method(CocosDebugLuaProfilerFrame *out, const LpLocalAcc *src) {
-    uint32_t i;
     CocosDebugIpcMethodSample *dst;
     if (!out || !src || !src->method_id) return;
-    for (i = 0; i < out->method_count; i++) {
-        if (out->methods[i].method_id != src->method_id) continue;
-        dst = &out->methods[i];
-        dst->self_ms += (float)lp_qpc_to_ms(src->self_qpc);
-        dst->inclusive_ms += (float)lp_qpc_to_ms(src->inclusive_qpc);
-        if ((float)lp_qpc_to_ms(src->max_self_qpc) > dst->max_self_ms)
-            dst->max_self_ms = (float)lp_qpc_to_ms(src->max_self_qpc);
-        if ((float)lp_qpc_to_ms(src->max_inclusive_qpc) > dst->max_inclusive_ms)
-            dst->max_inclusive_ms = (float)lp_qpc_to_ms(src->max_inclusive_qpc);
-        dst->calls_started += src->calls_started;
-        dst->calls_completed += src->calls_completed;
-        dst->active_at_end += src->active_at_end;
-        return;
+    if (src->method_id <= COCOS_DEBUG_IPC_METHOD_DICT_CAP) {
+        uint32_t slot = g_merge_method_slot[src->method_id];
+        if (slot) {
+            dst = &out->methods[slot - 1];
+            dst->self_ms += (float)lp_qpc_to_ms(src->self_qpc);
+            dst->inclusive_ms += (float)lp_qpc_to_ms(src->inclusive_qpc);
+            if ((float)lp_qpc_to_ms(src->max_self_qpc) > dst->max_self_ms)
+                dst->max_self_ms = (float)lp_qpc_to_ms(src->max_self_qpc);
+            if ((float)lp_qpc_to_ms(src->max_inclusive_qpc) > dst->max_inclusive_ms)
+                dst->max_inclusive_ms = (float)lp_qpc_to_ms(src->max_inclusive_qpc);
+            dst->calls_started += src->calls_started;
+            dst->calls_completed += src->calls_completed;
+            dst->active_at_end += src->active_at_end;
+            return;
+        }
     }
     if (out->method_count >= COCOS_DEBUG_IPC_METHOD_CAP) {
         lp_or_flag(COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED);
@@ -816,6 +1030,8 @@ static void lp_merge_method(CocosDebugLuaProfilerFrame *out, const LpLocalAcc *s
     dst->calls_started = src->calls_started;
     dst->calls_completed = src->calls_completed;
     dst->active_at_end = src->active_at_end;
+    if (src->method_id <= COCOS_DEBUG_IPC_METHOD_DICT_CAP)
+        g_merge_method_slot[src->method_id] = (uint16_t)out->method_count;
 }
 
 static void lp_merge_line(CocosDebugLuaProfilerFrame *out, const LpLineAcc *src) {
@@ -826,6 +1042,7 @@ static void lp_merge_line(CocosDebugLuaProfilerFrame *out, const LpLineAcc *src)
             out->lines[i].function_id == src->function_id &&
             out->lines[i].line == src->line) {
             out->lines[i].samples += src->samples;
+            out->lines[i].qpc += src->qpc;
             return;
         }
     }
@@ -837,6 +1054,7 @@ static void lp_merge_line(CocosDebugLuaProfilerFrame *out, const LpLineAcc *src)
     out->lines[out->line_count].function_id = src->function_id;
     out->lines[out->line_count].line = src->line;
     out->lines[out->line_count].samples = src->samples;
+    out->lines[out->line_count].qpc = src->qpc;
     out->line_count++;
 }
 
@@ -880,6 +1098,7 @@ void cocos_debug_lua_profiler_clear(void) {
     if (!g_initialized) return;
     EnterCriticalSection(&g_lock);
     memset(&g_frame, 0, sizeof(g_frame));
+    g_pending_outside_qpc = 0;
     for (i = 0; i < g_thread_count; i++) {
         LpThread *thread = &g_threads[i];
         EnterCriticalSection(&thread->lock);
@@ -890,12 +1109,17 @@ void cocos_debug_lua_profiler_clear(void) {
         thread->cpu_qpc = 0;
         thread->script_qpc = 0;
         thread->c_qpc = 0;
+        thread->outside_qpc = 0;
+        thread->outside_last_qpc = 0;
+        thread->open_line = 0;
         thread->hook_events = 0;
         thread->acc_count = 0;
         thread->interval_count = 0;
         thread->line_count = 0;
-        if (thread->storage)
+        if (thread->storage) {
             memset(thread->storage->line_hash, 0, sizeof(thread->storage->line_hash));
+            memset(thread->storage->acc_hash, 0, sizeof(thread->storage->acc_hash));
+        }
         LeaveCriticalSection(&thread->lock);
     }
     LeaveCriticalSection(&g_lock);
@@ -909,6 +1133,7 @@ void cocos_debug_lua_profiler_start(void) {
     memset(g_name_cache_hash, 0, sizeof(g_name_cache_hash));
     g_name_cache_count = 0;
     memset(&g_frame, 0, sizeof(g_frame));
+    g_pending_outside_qpc = 0;
     g_suspend_depth = 0;
     g_recording = 1;
     LeaveCriticalSection(&g_lock);
@@ -992,7 +1217,7 @@ void cocos_debug_lua_profiler_resume_enter(lua_State *L) {
     LeaveCriticalSection(&g_lock);
 }
 
-void cocos_debug_lua_profiler_resume_leave(lua_State *L) {
+void cocos_debug_lua_profiler_resume_leave(lua_State *L, int status) {
     uint64_t now;
     LpThread *thread;
     if (!g_initialized || !g_recording || !L) return;
@@ -1009,6 +1234,14 @@ void cocos_debug_lua_profiler_resume_leave(lua_State *L) {
         thread->running = 0;
         thread->last_account_qpc = 0;
         thread->busy_open = 0;
+        /* A coroutine that comes back with an error is dead: Lua unwound
+           every frame in it without emitting RET hooks, and it can never be
+           resumed again.  Clear the leftovers so the thread is not left
+           permanently holding a stack it will never pop. */
+        if (status != 0 && status != LUA_YIELD) {
+            lp_drop_frames_locked(thread, 0);
+            thread->overflow_depth = 0;
+        }
         lp_emit_locked(COCOS_DEBUG_IPC_LUA_EVENT_SUSPEND, thread, 0,
                        thread->stack_top + thread->overflow_depth, now);
         LeaveCriticalSection(&thread->lock);
@@ -1029,6 +1262,78 @@ void cocos_debug_lua_profiler_resume_leave(lua_State *L) {
             LeaveCriticalSection(&parent->lock);
         }
     }
+    LeaveCriticalSection(&g_lock);
+}
+
+int cocos_debug_lua_profiler_protected_enter(lua_State *L) {
+    LpThread *thread;
+    LpPcallBase *base;
+    int tracked = 0;
+    if (!g_initialized || !g_recording || !g_frame.active || !L) return 0;
+    EnterCriticalSection(&g_lock);
+    thread = lp_add_thread_locked(L);
+    if (thread) {
+        EnterCriticalSection(&thread->lock);
+        if (thread->pcall_depth < LP_PCALL_CAP) {
+            if (++g_pcall_token == 0) g_pcall_token = 1;
+            base = &thread->pcall_base[thread->pcall_depth++];
+            base->token = g_pcall_token;
+            base->stack_top = thread->stack_top;
+            base->overflow_depth = thread->overflow_depth;
+            tracked = (int)base->token;
+        }
+        LeaveCriticalSection(&thread->lock);
+    }
+    LeaveCriticalSection(&g_lock);
+    return tracked;
+}
+
+void cocos_debug_lua_profiler_protected_leave(lua_State *L, int tracked,
+                                              int status) {
+    LpThread *thread;
+    LpPcallBase base;
+    uint64_t now;
+    int failed;
+    if (!tracked || !g_initialized || !g_recording || !L) return;
+    failed = (status != 0 && status != LUA_YIELD);
+    now = lp_now();
+    EnterCriticalSection(&g_lock);
+    thread = lp_find_thread_locked(L);
+    if (!thread || thread->pcall_depth <= 0) {
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    EnterCriticalSection(&thread->lock);
+    base = thread->pcall_base[thread->pcall_depth - 1];
+    if (base.token != (uint32_t)tracked) {
+        /* Our record is gone: the shadow stacks were wiped under this call,
+           so the depth we saved says nothing about the stack we have now.
+           Leave the (newer) record alone and report the desync. */
+        if (failed) lp_or_flag(COCOS_DEBUG_IPC_FRAME_STACK_DESYNC);
+        LeaveCriticalSection(&thread->lock);
+        LeaveCriticalSection(&g_lock);
+        return;
+    }
+    thread->pcall_depth--;
+    memset(&thread->pcall_base[thread->pcall_depth], 0, sizeof(base));
+    /* Only a failed protected call unwinds.  Account first, then drop, so the
+       slice between the error and this hook stays in the thread level totals
+       instead of vanishing; the discarded frames' per-method self time is
+       re-attributed by lp_drop_frames_locked. */
+    if (failed && thread->running) {
+        if (g_frame.active)
+            lp_account_until_locked(thread, now);
+        lp_drop_frames_locked(thread, base.stack_top);
+        thread->overflow_depth = base.overflow_depth;
+        if (thread->stack_top <= 0 && thread->overflow_depth <= 0) {
+            lp_close_busy_locked(thread, now);
+            thread->running = 0;
+            thread->last_account_qpc = 0;
+        } else if (g_frame.active) {
+            thread->last_account_qpc = now;
+        }
+    }
+    LeaveCriticalSection(&thread->lock);
     LeaveCriticalSection(&g_lock);
 }
 
@@ -1056,6 +1361,7 @@ void cocos_debug_lua_profiler_frame_begin(uint64_t frame_sequence) {
     uint32_t i;
     uint64_t marker_qpc;
     uint64_t begin_qpc;
+    uint64_t carried_outside = 0;
     if (!g_initialized || !g_recording) return;
     EnterCriticalSection(&g_lock);
     memset(&g_frame, 0, sizeof(g_frame));
@@ -1064,6 +1370,12 @@ void cocos_debug_lua_profiler_frame_begin(uint64_t frame_sequence) {
         LpThread *thread = &g_threads[i];
         int si;
         EnterCriticalSection(&thread->lock);
+        /* The gap since the previous frame ended belongs to the frame that is
+           starting now -- it is the Lua this frame has to make room for. */
+        carried_outside += thread->outside_qpc;
+        thread->outside_qpc = 0;
+        thread->outside_last_qpc = 0;
+        thread->open_line = 0;
         thread->logical_qpc = 0;
         thread->last_account_qpc = 0;
         thread->busy_start_qpc = 0;
@@ -1075,14 +1387,17 @@ void cocos_debug_lua_profiler_frame_begin(uint64_t frame_sequence) {
         thread->acc_count = 0;
         thread->interval_count = 0;
         thread->line_count = 0;
-        if (thread->storage)
+        if (thread->storage) {
             memset(thread->storage->line_hash, 0, sizeof(thread->storage->line_hash));
+            memset(thread->storage->acc_hash, 0, sizeof(thread->storage->acc_hash));
+        }
         for (si = 0; si < thread->stack_top; si++) {
             g_stacks[i][si].frame_logical_start = 0;
             g_stacks[i][si].frame_self_qpc = 0;
         }
         LeaveCriticalSection(&thread->lock);
     }
+    g_pending_outside_qpc = carried_outside;
     marker_qpc = lp_now();
     g_frame.active = 1;
     lp_emit_locked(COCOS_DEBUG_IPC_LUA_EVENT_FRAME_BEGIN, NULL, 0, 0, marker_qpc);
@@ -1126,6 +1441,9 @@ int cocos_debug_lua_profiler_frame_end(CocosDebugLuaProfilerFrame *out) {
         if (thread->running) {
             lp_account_until_locked(thread, end_qpc);
             lp_close_busy_locked(thread, end_qpc);
+            /* Still running as the window closes: hand the ongoing slice over
+               to the outside-window clock so the gap is not lost. */
+            thread->outside_last_qpc = end_qpc;
         }
         for (si = 0; si < thread->stack_top; si++) {
             LpStackEntry *entry = &g_stacks[i][si];
@@ -1153,6 +1471,7 @@ int cocos_debug_lua_profiler_frame_end(CocosDebugLuaProfilerFrame *out) {
     lp_emit_locked(COCOS_DEBUG_IPC_LUA_EVENT_FRAME_END, NULL, 0, 0, end_qpc);
     wall_qpc = lp_union_thread_intervals(end_qpc);
 
+    memset(g_merge_method_slot, 0, sizeof(g_merge_method_slot));
     for (i = 0; i < g_thread_count; i++) {
         LpThread *thread = &g_threads[i];
         uint32_t n;
@@ -1172,6 +1491,7 @@ int cocos_debug_lua_profiler_frame_end(CocosDebugLuaProfilerFrame *out) {
     out->lua_cpu_ms = lp_qpc_to_ms(cpu_qpc);
     out->lua_script_self_ms = lp_qpc_to_ms(script_qpc);
     out->lua_c_self_ms = lp_qpc_to_ms(c_qpc);
+    out->lua_outside_ms = lp_qpc_to_ms(g_pending_outside_qpc);
     out->hook_events = (uint32_t)g_frame.hook_events;
     out->flags = (uint32_t)g_frame.flags;
     g_frame.active = 0;
@@ -1258,6 +1578,8 @@ void cocos_debug_lua_profiler_test_call(lua_State *L, uint32_t method_id,
         thread->hook_events++;
         InterlockedIncrement(&g_frame.hook_events);
     }
+    if (!was_running && g_frame.active)
+        thread->logical_qpc = 0;
     if (thread->stack_top < COCOS_DEBUG_LUA_PROFILER_STACK_CAP) {
         entry = &g_stacks[thread->id - 1][thread->stack_top++];
         memset(entry, 0, sizeof(*entry));
@@ -1277,7 +1599,6 @@ void cocos_debug_lua_profiler_test_call(lua_State *L, uint32_t method_id,
     if (!was_running && g_frame.active) {
         thread->busy_start_qpc = now;
         thread->busy_open = 1;
-        thread->logical_qpc = 0;
     }
     if (g_frame.active)
         thread->last_account_qpc = now;

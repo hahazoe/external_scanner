@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define COCOS_DEBUG_IPC_MAGIC 0x42444343u /* CCDB */
-#define COCOS_DEBUG_IPC_VERSION 8u
+#define COCOS_DEBUG_IPC_VERSION 9u
 #define COCOS_DEBUG_IPC_MAPPING_FMT "Local\\CocosDebugProfiler_v%u_%lu"
 
 #define COCOS_DEBUG_IPC_CPP_CAP 12
@@ -63,7 +63,13 @@ enum CocosDebugIpcFeatures {
     COCOS_DEBUG_IPC_FEATURE_CPP_HOOKS = 1u << 1,
     COCOS_DEBUG_IPC_FEATURE_EVENT_STREAM = 1u << 2,
     COCOS_DEBUG_IPC_FEATURE_PRECISE_LUA = 1u << 3,
-    COCOS_DEBUG_IPC_FEATURE_LINE_SAMPLES = 1u << 4
+    COCOS_DEBUG_IPC_FEATURE_LINE_SAMPLES = 1u << 4,
+    /* CocosDebugIpcLineSample carries a real qpc budget, so the line view is
+       wall-time based instead of instruction-count based. */
+    COCOS_DEBUG_IPC_FEATURE_LINE_QPC_TIME = 1u << 5,
+    /* CocosDebugIpcFrame carries lua_outside_ms: Lua time spent outside the
+       drawScene window (previously thrown away entirely). */
+    COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW = 1u << 6
 };
 
 enum CocosDebugIpcLuaMethodKind {
@@ -144,6 +150,12 @@ typedef struct CocosDebugIpcLineSample {
     uint32_t function_id;
     int32_t line;
     uint32_t samples;
+    /* Wall time attributed to this line: the time from this line's sample
+       until the next hook event on the same thread.  Unlike `samples`
+       (LUA_MASKCOUNT, one hit per 4000 VM instructions) this also covers
+       time burnt inside C calls made from the line, which the instruction
+       counter never sees.  0 when line capture was off. */
+    uint64_t qpc;
 } CocosDebugIpcLineSample;
 
 typedef struct CocosDebugIpcLuaEvent {
@@ -173,6 +185,10 @@ typedef struct CocosDebugIpcFrame {
     float lua_cpu_ms;
     float lua_script_self_ms;
     float lua_c_self_ms;
+    /* Lua wall time spent in the gap since the previous frame ended, i.e.
+       outside the drawScene body window.  Not part of lua_cpu_ms and not
+       attributed to any method -- it is the Lua the old window discarded. */
+    float lua_outside_ms;
     float lua_mem_kb;
     uint32_t hook_events;
     uint32_t flags;
@@ -236,13 +252,13 @@ typedef struct CocosDebugIpcBlock {
 #ifdef __cplusplus
 static_assert(sizeof(CocosDebugIpcMethodSample) == 40, "IPC method layout changed");
 static_assert(sizeof(CocosDebugIpcCppSample) == 24, "IPC C++ layout changed");
-static_assert(sizeof(CocosDebugIpcLineSample) == 16, "IPC line layout changed");
+static_assert(sizeof(CocosDebugIpcLineSample) == 24, "IPC line layout changed");
 static_assert(sizeof(CocosDebugIpcLuaEvent) == 40, "IPC event layout changed");
 static_assert(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping is too large");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(CocosDebugIpcMethodSample) == 40, "IPC method layout changed");
 _Static_assert(sizeof(CocosDebugIpcCppSample) == 24, "IPC C++ layout changed");
-_Static_assert(sizeof(CocosDebugIpcLineSample) == 16, "IPC line layout changed");
+_Static_assert(sizeof(CocosDebugIpcLineSample) == 24, "IPC line layout changed");
 _Static_assert(sizeof(CocosDebugIpcLuaEvent) == 40, "IPC event layout changed");
 _Static_assert(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping is too large");
 #endif

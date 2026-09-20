@@ -21,9 +21,11 @@ int main(void) {
     int command_sequence = 0;
 
     CHECK(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping unexpectedly large");
-    CHECK(COCOS_DEBUG_IPC_VERSION == 8u, "unexpected IPC version");
+    CHECK(COCOS_DEBUG_IPC_VERSION == 9u, "unexpected IPC version");
     CHECK(sizeof(CocosDebugIpcMethodSample) == 40u, "method layout");
     CHECK(sizeof(CocosDebugIpcLuaEvent) == 40u, "event layout");
+    /* Lines carry a qpc budget now, so the layout is 24 bytes, not 16. */
+    CHECK(sizeof(CocosDebugIpcLineSample) == 24u, "line layout");
     _snprintf(name, sizeof(name), COCOS_DEBUG_IPC_MAPPING_FMT,
               (unsigned)COCOS_DEBUG_IPC_VERSION, (unsigned long)pid);
     mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
@@ -46,6 +48,35 @@ int main(void) {
     CHECK(first_method != 0, "first dictionary insert");
     CHECK(first_method == same_method, "dictionary de-duplication");
     CHECK(second_method != 0 && second_method != first_method, "second dictionary insert");
+
+    /* Regression: a key longer than the dictionary's fixed key field was
+       hashed over its full length while only the first bytes were stored, so
+       it could never compare equal to its own entry.  Every call burned a
+       fresh slot, and this dictionary is process global and never cleared:
+       after 4096 such keys every new method came back as method_id 0 and its
+       time silently dropped out of the method table. */
+    {
+        static char long_key[900];
+        uint32_t before_count;
+        uint32_t long_a, long_b, long_c;
+        size_t i;
+        for (i = 0; i + 1 < sizeof(long_key); i++)
+            long_key[i] = (char)('a' + (int)(i % 26));
+        long_key[sizeof(long_key) - 1] = 0;
+        before_count = (uint32_t)ipc->header.dictionary_count;
+        long_a = cocos_debug_telemetry_intern_method(long_key);
+        CHECK(long_a != 0, "long key insert");
+        long_b = cocos_debug_telemetry_intern_method(long_key);
+        CHECK(long_a == long_b, "long key de-duplication");
+        CHECK((uint32_t)ipc->header.dictionary_count == before_count + 1u,
+              "long keys must not leak dictionary slots");
+        long_key[0] = 'z';
+        before_count = (uint32_t)ipc->header.dictionary_count;
+        long_c = cocos_debug_telemetry_intern_method(long_key);
+        CHECK(long_c != 0 && long_c != long_a, "long key distinctness");
+        CHECK((uint32_t)ipc->header.dictionary_count == before_count + 1u,
+              "second long key must take exactly one slot");
+    }
 
     frame = cocos_debug_telemetry_begin_frame(1);
     CHECK(frame != NULL && (frame->sequence & 1), "frame write seqlock");

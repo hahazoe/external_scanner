@@ -41,6 +41,7 @@ typedef struct CocosDebugLuaProfilerFrame {
     double lua_cpu_ms;
     double lua_script_self_ms;
     double lua_c_self_ms;
+    double lua_outside_ms;
     uint32_t hook_events;
     uint32_t flags;
     uint32_t method_count;
@@ -57,7 +58,19 @@ void cocos_debug_lua_profiler_clear(void);
 
 void cocos_debug_lua_profiler_register_thread(lua_State *L);
 void cocos_debug_lua_profiler_resume_enter(lua_State *L);
-void cocos_debug_lua_profiler_resume_leave(lua_State *L);
+void cocos_debug_lua_profiler_resume_leave(lua_State *L, int status);
+
+/* Protected-call boundary tracking.  A thrown Lua error unwinds with a
+   longjmp, so the RET hooks of every frame between the error and the
+   catching lua_pcall/lua_resume never fire.  The CALL/RET shadow stack
+   would keep those dead frames forever -- every later inclusive time is
+   computed against them and, once the 256 deep stack fills up, the thread
+   loses all attribution.  Wrap lua_pcall with enter/leave so the shadow
+   stack can be unwound to the depth recorded at entry.  Both calls are
+   cheap no-ops unless a frame is being recorded. */
+int cocos_debug_lua_profiler_protected_enter(lua_State *L);
+void cocos_debug_lua_profiler_protected_leave(lua_State *L, int tracked,
+                                              int status);
 
 void cocos_debug_lua_profiler_set_line_capture(int enabled);
 void cocos_debug_lua_profiler_set_trace(int enabled);

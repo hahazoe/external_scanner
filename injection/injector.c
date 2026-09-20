@@ -478,7 +478,9 @@ static int create_session_mapping(DWORD pid, CocosDebugInjectionSession *session
         COCOS_DEBUG_IPC_FEATURE_CPP_HOOKS |
         COCOS_DEBUG_IPC_FEATURE_EVENT_STREAM |
         COCOS_DEBUG_IPC_FEATURE_PRECISE_LUA |
-        COCOS_DEBUG_IPC_FEATURE_LINE_SAMPLES;
+        COCOS_DEBUG_IPC_FEATURE_LINE_SAMPLES |
+        COCOS_DEBUG_IPC_FEATURE_LINE_QPC_TIME |
+        COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW;
     ipc->header.qpc_frequency = (uint64_t)freq.QuadPart;
     ipc->header.state = COCOS_DEBUG_IPC_STATE_CREATED;
     ipc->header.viewer_heartbeat_ms = GetTickCount();

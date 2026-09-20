@@ -169,7 +169,7 @@ void TelemetryClient::heartbeat() {
         session_->ipc->header.viewer_heartbeat_ms = GetTickCount();
 }
 
-std::string TelemetryClient::methodName(uint32_t method_id) {
+const std::string *TelemetryClient::methodName(uint32_t method_id) {
     char fallback[32];
     CocosDebugIpcMethodDictionaryEntry *entry;
     LONG before, after;
@@ -177,24 +177,27 @@ std::string TelemetryClient::methodName(uint32_t method_id) {
     if (!session_ || !session_->ipc || method_id == 0 ||
         method_id > COCOS_DEBUG_IPC_METHOD_DICT_CAP) {
         _snprintf(fallback, sizeof(fallback), "#%u", method_id);
-        return fallback;
+        return cocos_debug_pool_intern(fallback);
     }
-    if (method_id <= method_cache_.size() && !method_cache_[method_id - 1].empty())
+    if (method_id <= method_cache_.size() && method_cache_[method_id - 1])
         return method_cache_[method_id - 1];
 
     entry = &session_->ipc->dictionary[method_id - 1];
     before = InterlockedCompareExchange((LONG *)&entry->sequence, 0, 0);
-    if (before & 1) return "<updating>";
+    if (before & 1) return cocos_debug_pool_intern("<updating>");
     memcpy(key, entry->key, sizeof(key));
     key[sizeof(key) - 1] = 0;
     MemoryBarrier();
     after = InterlockedCompareExchange((LONG *)&entry->sequence, 0, 0);
     if (before != after || (after & 1) || entry->method_id != method_id)
-        return "<unavailable>";
-    if (method_cache_.size() < method_id)
-        method_cache_.resize(method_id);
-    method_cache_[method_id - 1] = key;
-    return method_cache_[method_id - 1];
+        return cocos_debug_pool_intern("<unavailable>");
+    {
+        const std::string *pooled = cocos_debug_pool_intern(key);
+        if (method_cache_.size() < method_id)
+            method_cache_.resize(method_id);
+        method_cache_[method_id - 1] = pooled;
+        return pooled;
+    }
 }
 
 bool TelemetryClient::pollIpcOnce() {
@@ -260,6 +263,7 @@ bool TelemetryClient::pollIpcOnce() {
         snapshot.lua_cpu_ms = scratch_->lua_cpu_ms;
         snapshot.lua_script_self_ms = scratch_->lua_script_self_ms;
         snapshot.lua_c_self_ms = scratch_->lua_c_self_ms;
+        snapshot.lua_outside_ms = scratch_->lua_outside_ms;
         snapshot.lua_mem_kb = scratch_->lua_mem_kb;
         snapshot.hook_events = scratch_->hook_events;
         snapshot.flags = scratch_->flags;
@@ -268,6 +272,7 @@ bool TelemetryClient::pollIpcOnce() {
             const CocosDebugIpcMethodSample &value = scratch_->methods[i];
             LuaMethodSnapshot item;
             item.name = methodName(value.method_id);
+            item.method_id = value.method_id;
             item.kind = value.kind;
             item.flags = value.flags;
             item.self_ms = value.self_ms;
@@ -284,9 +289,10 @@ bool TelemetryClient::pollIpcOnce() {
             const CocosDebugIpcCppSample &value = scratch_->cpp[i];
             CppMethodSnapshot item;
             if (value.target_index < ipc->config.cpp_count)
-                item.name = ipc->config.cpp_targets[value.target_index].name;
+                item.name = cocos_debug_pool_intern(
+                    ipc->config.cpp_targets[value.target_index].name);
             else
-                item.name = "<cpp>";
+                item.name = cocos_debug_pool_intern("<cpp>");
             item.total_ms = value.total_ms;
             item.max_ms = value.max_ms;
             item.last_ms = value.last_ms;
@@ -299,9 +305,15 @@ bool TelemetryClient::pollIpcOnce() {
             const CocosDebugIpcLineSample &value = scratch_->lines[i];
             LuaLineSnapshot item;
             item.source = methodName(value.source_id);
-            item.function_name = value.function_id ? methodName(value.function_id) : "";
+            item.function_name = value.function_id
+                ? methodName(value.function_id)
+                : cocos_debug_pool_intern("");
             item.line = value.line;
             item.samples = value.samples;
+            item.line_ms = ipc->header.qpc_frequency
+                ? (float)((double)value.qpc * 1000.0 /
+                          (double)ipc->header.qpc_frequency)
+                : 0.0f;
             snapshot.lua_lines.push_back(item);
         }
         cocos_debug_fill_scene_render(&snapshot);
@@ -355,7 +367,9 @@ bool TelemetryClient::pollEvents(CocosDebugIpcBlock *ipc) {
         snapshot.lua_thread_id = copy.lua_thread_id;
         snapshot.os_thread_id = copy.os_thread_id;
         snapshot.method_id = copy.method_id;
-        snapshot.method_name = copy.method_id ? methodName(copy.method_id) : "";
+        snapshot.method_name = copy.method_id
+            ? methodName(copy.method_id)
+            : cocos_debug_pool_intern("");
         snapshot.depth = copy.depth;
         snapshot.type = copy.type;
         snapshot.flags = copy.flags;

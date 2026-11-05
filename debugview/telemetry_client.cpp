@@ -244,6 +244,9 @@ bool TelemetryClient::pollIpcOnce() {
             scratch_->method_count = method_count;
             scratch_->line_count = line_count;
         }
+        scratch_->actor_x = source->actor_x;
+        scratch_->actor_y = source->actor_y;
+        scratch_->actor_valid = source->actor_valid;
         MemoryBarrier();
         after = InterlockedCompareExchange((LONG *)&source->sequence, 0, 0);
         if (before != after || (after & 1) || scratch_->publish_sequence != sequence) {
@@ -265,8 +268,13 @@ bool TelemetryClient::pollIpcOnce() {
         snapshot.lua_c_self_ms = scratch_->lua_c_self_ms;
         snapshot.lua_outside_ms = scratch_->lua_outside_ms;
         snapshot.lua_mem_kb = scratch_->lua_mem_kb;
+        snapshot.proc_ws_kb = scratch_->proc_ws_kb;
+        snapshot.proc_private_kb = scratch_->proc_private_kb;
         snapshot.hook_events = scratch_->hook_events;
         snapshot.flags = scratch_->flags;
+        snapshot.actor_x = scratch_->actor_x;
+        snapshot.actor_y = scratch_->actor_y;
+        snapshot.actor_valid = scratch_->actor_valid;
         snapshot.lua_methods.reserve(scratch_->method_count);
         for (i = 0; i < scratch_->method_count && i < COCOS_DEBUG_IPC_METHOD_CAP; i++) {
             const CocosDebugIpcMethodSample &value = scratch_->methods[i];

@@ -261,11 +261,12 @@ struct Application {
     bool paused;
     bool pending_autosave;
     bool was_recording;
-    bool follow_target;
     float frame_window;
     float spike_threshold_ms;
     bool show_spike_hints;
+    bool show_cpp_hooks_plot;
     char method_filter[128];
+    int method_kind_filter;
     /* Cross-frame analysis (aggregate / spike diff / per-method curve). */
     bool show_cross_frame;
     char aggregate_filter[128];
@@ -285,7 +286,6 @@ struct Application {
     std::vector<double> ts_body;
     bool ts_dirty;
     std::string status_message;
-    DWORD last_dock_tick;
     DWORD last_preview_tick;
     double last_plot_xmin;
     double last_plot_xmax;
@@ -298,6 +298,11 @@ struct Application {
     std::vector<double> plot_lua_self;
     std::vector<double> plot_c_self;
     std::vector<double> plot_lua_outside;
+    std::vector<double> plot_lua_mem;
+    std::vector<double> plot_proc_ws;
+    std::vector<double> plot_proc_private;
+    std::vector<std::string> plot_cpp_labels;
+    std::vector<std::vector<double> > plot_cpp_series;
     size_t plot_begin_index;
     bool show_lua_editor;
     char lua_editor_text[COCOS_DEBUG_IPC_REMOTE_LUA_CAP];
@@ -321,14 +326,16 @@ struct Application {
         : process_count(0), selected_process(-1), last_process_refresh(0),
           worker(NULL), worker_done(0), injecting(0), progress(0),
           selected_sequence(0), paused(false), pending_autosave(false),
-          was_recording(false), follow_target(true), frame_window(180.0f),
+          was_recording(false), frame_window(180.0f),
           spike_threshold_ms(16.67f), show_spike_hints(true),
+          show_cpp_hooks_plot(true),
+          method_kind_filter(0),
           show_cross_frame(false), aggregate_window(600),
           selected_method_id(0), aggregate_cached_size(0),
           aggregate_cached_first(0), aggregate_last_build(0),
           aggregate_frame_count(0), aggregate_spike_count(0),
           aggregate_median_baseline_ms(0), ts_dirty(true),
-          last_dock_tick(0), last_preview_tick(0),
+          last_preview_tick(0),
           last_plot_xmin(0), last_plot_xmax(0), plot_begin_index(0),
           show_lua_editor(false),
           lua_editor_wait_result_seq(0), lua_editor_waiting(false),
@@ -619,19 +626,6 @@ struct Application {
         (void)n;
     }
 
-    void dockWindow() {
-        DWORD now = GetTickCount();
-        if (!follow_target || !session.target_window || now - last_dock_tick < 100) return;
-        last_dock_tick = now;
-        if (!IsWindow(session.target_window)) return;
-        RECT rect;
-        if (!GetWindowRect(session.target_window, &rect) || IsIconic(session.target_window)) return;
-        int width = 980;
-        int height = std::max(500L, rect.bottom - rect.top);
-        SetWindowPos(g_window, HWND_TOP, rect.right + 8, rect.top, width, height,
-                     SWP_NOACTIVATE);
-    }
-
     const FrameSnapshot *selectedFrame() const {
         if (history.empty()) return NULL;
         if (!selected_sequence) {
@@ -745,8 +739,6 @@ struct Application {
                 selected_sequence = 0;
         }
         ImGui::SameLine();
-        ImGui::Checkbox("Follow target window", &follow_target);
-        ImGui::SameLine();
         ImGui::BeginDisabled(history.empty());
         if (ImGui::Button("Save now")) saveRecordingDialog();
         ImGui::EndDisabled();
@@ -780,6 +772,11 @@ struct Application {
                 ImGui::SetTooltip("Highlight frames whose drawScene body exceeds this budget.\n"
                                   "Default 16.67 ms ≈ 60 FPS.");
         }
+        ImGui::SameLine();
+        ImGui::Checkbox("Plot C++ hooks", &show_cpp_hooks_plot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("在曲线上叠加 Scheduler / EventDispatcher / 贴图等 C++ 钩子。\n"
+                              "drawScene 与 Renderer:render 仍用原来的专用曲线。");
         ImGui::Text("buffered: %u  frame queue: %u  event queue: %u",
                     (unsigned)history.size(), (unsigned)telemetry.queueSize(),
                     (unsigned)telemetry.eventQueueSize());
@@ -792,6 +789,28 @@ struct Application {
                             ? (unsigned)session.ipc->config.director_delta_time_offset : 0u);
             if (telemetry.error()[0]) ImGui::TextColored(ImVec4(1, .35f, .3f, 1),
                                                           "%s", telemetry.error());
+            {
+                uint32_t installed = installedCppHookCount();
+                uint32_t configured = session.ipc ? session.ipc->config.cpp_count : 0;
+                ImGui::Text("C++ hooks: %u installed / %u configured",
+                            (unsigned)installed, (unsigned)configured);
+                if (ImGui::IsItemHovered() && session.ipc) {
+                    ImGui::BeginTooltip();
+                    ImGui::TextUnformatted("注入时解析到的 C++ 目标：");
+                    for (uint32_t i = 0; i < configured && i < COCOS_DEBUG_IPC_CPP_CAP; i++) {
+                        const CocosDebugIpcCppTarget &t = session.ipc->config.cpp_targets[i];
+                        if (t.address >= 0x10000u)
+                            ImGui::Text("%s  @ 0x%08X", t.name, (unsigned)t.address);
+                        else
+                            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                                               "%s  (未解析)", t.name);
+                    }
+                    ImGui::EndTooltip();
+                }
+                if (installed <= 3)
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                                       "钩子偏少：请重启目标进程后用新 DebugView 重新注入。");
+            }
             if (!rendererHookConfigured())
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
                                    "render hook: not installed (cc.Renderer:render). "
@@ -803,6 +822,31 @@ struct Application {
             else
                 ImGui::TextDisabled("render hook: cc.Renderer:render");
         }
+    }
+
+    static bool isPrimaryCppPlotName(const std::string &name) {
+        /* Already covered by dedicated DrawScene / render series. */
+        return name.find("drawScene") != std::string::npos ||
+               name.find("Renderer:render") != std::string::npos;
+    }
+
+    static std::string shortCppHookLabel(const std::string &name) {
+        size_t pos = name.rfind("cc.");
+        if (pos != std::string::npos) return name.substr(pos + 3);
+        pos = name.rfind("::");
+        if (pos != std::string::npos) return name.substr(pos + 2);
+        return name;
+    }
+
+    uint32_t installedCppHookCount() const {
+        uint32_t n = 0;
+        uint32_t i;
+        if (!session.ipc) return 0;
+        for (i = 0; i < session.ipc->config.cpp_count && i < COCOS_DEBUG_IPC_CPP_CAP; i++) {
+            if (session.ipc->config.cpp_targets[i].address >= 0x10000u)
+                n++;
+        }
+        return n;
     }
 
     bool rendererHookConfigured() const {
@@ -860,6 +904,41 @@ struct Application {
         plot_lua_self.resize(n);
         plot_c_self.resize(n);
         plot_lua_outside.resize(n);
+        plot_lua_mem.resize(n);
+        plot_proc_ws.resize(n);
+        plot_proc_private.resize(n);
+        plot_cpp_labels.clear();
+        plot_cpp_series.clear();
+        if (show_cpp_hooks_plot && n > 0) {
+            std::map<std::string, size_t> cpp_index;
+            for (i = 0; i < n; i++) {
+                const FrameSnapshot &frame = history[begin + i];
+                for (size_t j = 0; j < frame.cpp_methods.size(); j++) {
+                    const std::string &name =
+                        cocos_debug_snapshot_text(frame.cpp_methods[j].name);
+                    if (name.empty() || isPrimaryCppPlotName(name)) continue;
+                    if (cpp_index.find(name) != cpp_index.end()) continue;
+                    if (plot_cpp_labels.size() >= 20) break;
+                    cpp_index[name] = plot_cpp_labels.size();
+                    plot_cpp_labels.push_back(shortCppHookLabel(name));
+                }
+                if (plot_cpp_labels.size() >= 20) break;
+            }
+            plot_cpp_series.resize(plot_cpp_labels.size());
+            for (size_t s = 0; s < plot_cpp_series.size(); s++) {
+                plot_cpp_series[s].assign(n, 0.0);
+            }
+            for (i = 0; i < n; i++) {
+                const FrameSnapshot &frame = history[begin + i];
+                for (size_t j = 0; j < frame.cpp_methods.size(); j++) {
+                    const CppMethodSnapshot &method = frame.cpp_methods[j];
+                    const std::string &name = cocos_debug_snapshot_text(method.name);
+                    std::map<std::string, size_t>::iterator it = cpp_index.find(name);
+                    if (it == cpp_index.end()) continue;
+                    plot_cpp_series[it->second][i] = (double)method.total_ms;
+                }
+            }
+        }
         for (i = 0; i < n; i++) {
             const FrameSnapshot &frame = history[begin + i];
             plot_x[i] = (double)frame.lua_frame_index;
@@ -871,6 +950,9 @@ struct Application {
             plot_lua_self[i] = frame.lua_script_self_ms;
             plot_c_self[i] = frame.lua_c_self_ms;
             plot_lua_outside[i] = frame.lua_outside_ms;
+            plot_lua_mem[i] = (double)frame.lua_mem_kb / 1024.0;
+            plot_proc_ws[i] = (double)frame.proc_ws_kb / 1024.0;
+            plot_proc_private[i] = (double)frame.proc_private_kb / 1024.0;
         }
     }
 
@@ -905,6 +987,41 @@ struct Application {
         std::vector<double> &lua_self = plot_lua_self;
         std::vector<double> &c_self = plot_c_self;
         std::vector<double> &lua_outside = plot_lua_outside;
+        std::vector<double> &lua_mem = plot_lua_mem;
+        std::vector<double> &proc_ws = plot_proc_ws;
+        std::vector<double> &proc_private = plot_proc_private;
+        bool proc_mem_visible = false;
+        double proc_lo = 0.0;
+        double proc_hi = 0.0;
+        double ws_lo = 0.0;
+        double ws_hi = 0.0;
+        double priv_lo = 0.0;
+        double priv_hi = 0.0;
+        bool ws_seen = false;
+        bool priv_seen = false;
+        for (size_t i = 0; i < proc_ws.size(); i++) {
+            if (proc_ws[i] > 0.0) {
+                if (!ws_seen) { ws_lo = ws_hi = proc_ws[i]; ws_seen = true; }
+                else {
+                    if (proc_ws[i] < ws_lo) ws_lo = proc_ws[i];
+                    if (proc_ws[i] > ws_hi) ws_hi = proc_ws[i];
+                }
+            }
+            if (proc_private[i] > 0.0) {
+                if (!priv_seen) { priv_lo = priv_hi = proc_private[i]; priv_seen = true; }
+                else {
+                    if (proc_private[i] < priv_lo) priv_lo = proc_private[i];
+                    if (proc_private[i] > priv_hi) priv_hi = proc_private[i];
+                }
+            }
+        }
+        if (ws_seen || priv_seen) {
+            proc_mem_visible = true;
+            proc_lo = ws_seen ? ws_lo : priv_lo;
+            proc_hi = ws_seen ? ws_hi : priv_hi;
+            if (priv_seen && priv_lo < proc_lo) proc_lo = priv_lo;
+            if (priv_seen && priv_hi > proc_hi) proc_hi = priv_hi;
+        }
 
         /* Visible-window summaries use v7 Body for slow frames and Lua wall for Lua heat. */
         int over_count = 0;
@@ -914,8 +1031,8 @@ struct Application {
         uint32_t hottest_lua_frame = 0;
         for (size_t i = 0; i < x.size(); i++) {
             const FrameSnapshot &frame = history[plot_begin_index + i];
-            if (lua_wall[i] > hottest_lua_ms) {
-                hottest_lua_ms = lua_wall[i];
+            if (lua_cpu[i] > hottest_lua_ms) {
+                hottest_lua_ms = lua_cpu[i];
                 hottest_lua_frame = frame.lua_frame_index;
             }
             if (draw[i] <= thr) continue;
@@ -934,7 +1051,7 @@ struct Application {
                 ImGui::TextDisabled("DrawScene within budget (<= %.2f ms)", spike_threshold_ms);
             }
             ImGui::SameLine();
-            ImGui::Text(" | Lua hot #%u %.2f ms wall",
+            ImGui::Text(" | Lua hot #%u %.2f ms 总耗时",
                         (unsigned)hottest_lua_frame, hottest_lua_ms);
             if (!history.empty() && history.back().drawscene_body_ms > spike_threshold_ms) {
                 ImGui::SameLine();
@@ -944,25 +1061,132 @@ struct Application {
                                    history.back().drawscene_body_ms);
             }
         }
+        if (proc_mem_visible) {
+            if (show_spike_hints) ImGui::SameLine();
+            ImGui::Text(show_spike_hints ? " | 进程内存 %.0f–%.0f MB | 专用提交 %.0f–%.0f MB"
+                                         : "进程内存 %.0f–%.0f MB | 专用提交 %.0f–%.0f MB",
+                        ws_lo, ws_hi, priv_lo, priv_hi);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("进程内存与任务管理器进程列表的「内存」列相同，\n"
+                                  "统计的是活动专用工作集。专用提交是私有提交量。");
+        }
+        if (!lua_mem.empty()) {
+            double mem_min = lua_mem[0];
+            double mem_max = lua_mem[0];
+            for (size_t i = 1; i < lua_mem.size(); i++) {
+                if (lua_mem[i] < mem_min) mem_min = lua_mem[i];
+                if (lua_mem[i] > mem_max) mem_max = lua_mem[i];
+            }
+            if (show_spike_hints || proc_mem_visible) ImGui::SameLine();
+            ImGui::Text(show_spike_hints || proc_mem_visible
+                            ? " | Lua 内存 %.1f–%.1f MB"
+                            : "Lua 内存 %.1f–%.1f MB",
+                        mem_min, mem_max);
+        }
 
         ImGui::BeginChild("##plot_pane", ImVec2(plot_width, 300), false);
         if (ImPlot::BeginPlot("Real-time performance", ImVec2(-1, -1))) {
             ImPlot::SetupAxes("frame", "ms");
+            /* Process memory owns the inner right axis. Lua stays on an outer
+               axis so its ~170 MB scale is not what gets read as process RAM. */
+            ImPlot::SetupAxis(ImAxis_Y2,
+                              proc_mem_visible ? "进程 MB" : "MB",
+                              ImPlotAxisFlags_AuxDefault);
+            ImPlot::SetupAxisFormat(ImAxis_Y2, proc_mem_visible ? "%.0f" : "%.1f");
+            if (proc_mem_visible) {
+                ImPlot::SetupAxis(ImAxis_Y3, "Lua MB", ImPlotAxisFlags_AuxDefault);
+                ImPlot::SetupAxisFormat(ImAxis_Y3, "%.1f");
+            }
             if (!paused && !x.empty()) {
                 double xmax = x.back();
                 ImPlot::SetupAxisLimits(ImAxis_X1, std::max(0.0, xmax - frame_window),
                                         std::max((double)frame_window, xmax), ImPlotCond_Always);
+            }
+            if (!lua_mem.empty()) {
+                /* Keep at least an 8 MB span so tiny GC steps don't Autofit
+                   into a full-height staircase on the secondary axis. */
+                double mem_lo = lua_mem[0];
+                double mem_hi = lua_mem[0];
+                for (size_t i = 1; i < lua_mem.size(); i++) {
+                    if (lua_mem[i] < mem_lo) mem_lo = lua_mem[i];
+                    if (lua_mem[i] > mem_hi) mem_hi = lua_mem[i];
+                }
+                double span = mem_hi - mem_lo;
+                if (span < 8.0) {
+                    double mid = 0.5 * (mem_lo + mem_hi);
+                    mem_lo = mid - 4.0;
+                    mem_hi = mid + 4.0;
+                    if (mem_lo < 0.0) {
+                        mem_hi -= mem_lo;
+                        mem_lo = 0.0;
+                    }
+                } else {
+                    double pad = span * 0.1;
+                    mem_lo -= pad;
+                    mem_hi += pad;
+                    if (mem_lo < 0.0) mem_lo = 0.0;
+                }
+                ImPlot::SetupAxisLimits(proc_mem_visible ? ImAxis_Y3 : ImAxis_Y2,
+                                        mem_lo, mem_hi,
+                                        paused ? ImPlotCond_Once : ImPlotCond_Always);
+            }
+            if (proc_mem_visible) {
+                /* Keep at least a 64 MB span so small allocator noise does
+                   not Autofit into a full-height line on the process axis. */
+                double axis_lo = proc_lo;
+                double axis_hi = proc_hi;
+                double span = axis_hi - axis_lo;
+                if (span < 64.0) {
+                    double mid = 0.5 * (axis_lo + axis_hi);
+                    axis_lo = mid - 32.0;
+                    axis_hi = mid + 32.0;
+                    if (axis_lo < 0.0) {
+                        axis_hi -= axis_lo;
+                        axis_lo = 0.0;
+                    }
+                } else {
+                    double pad = span * 0.1;
+                    axis_lo -= pad;
+                    axis_hi += pad;
+                    if (axis_lo < 0.0) axis_lo = 0.0;
+                }
+                ImPlot::SetupAxisLimits(ImAxis_Y2, axis_lo, axis_hi,
+                                        paused ? ImPlotCond_Once : ImPlotCond_Always);
             }
             if (!x.empty()) {
                 ImPlot::PlotLine("DrawScene", &x[0], &draw[0], (int)x.size());
                 ImPlot::PlotLine("DeltaTime", &x[0], &delta[0], (int)x.size());
                 if (rendererHasSamples())
                     ImPlot::PlotLine("render", &x[0], &render[0], (int)x.size());
+                if (show_cpp_hooks_plot) {
+                    for (size_t s = 0; s < plot_cpp_series.size() && s < plot_cpp_labels.size();
+                         s++) {
+                        if (plot_cpp_series[s].empty()) continue;
+                        ImPlot::PlotLine(plot_cpp_labels[s].c_str(), &x[0],
+                                         &plot_cpp_series[s][0], (int)x.size());
+                    }
+                }
                 ImPlot::PlotLine("Lua wall", &x[0], &lua_wall[0], (int)x.size());
-                ImPlot::PlotLine("Lua CPU", &x[0], &lua_cpu[0], (int)x.size());
-                ImPlot::PlotLine("Lua self", &x[0], &lua_self[0], (int)x.size());
-                ImPlot::PlotLine("C self", &x[0], &c_self[0], (int)x.size());
+                ImPlot::PlotLine("Lua 总耗时", &x[0], &lua_cpu[0], (int)x.size());
+                ImPlot::PlotLine("Lua 脚本", &x[0], &lua_self[0], (int)x.size());
+                ImPlot::PlotLine("C", &x[0], &c_self[0], (int)x.size());
                 ImPlot::PlotLine("Lua outside", &x[0], &lua_outside[0], (int)x.size());
+                if (proc_mem_visible) {
+                    ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+                    ImPlot::PlotLine("进程内存", &x[0], &proc_ws[0], (int)x.size(), {
+                        ImPlotProp_LineColor, ImVec4(0.35f, 0.85f, 0.95f, 1.0f)
+                    });
+                    ImPlot::PlotLine("专用提交", &x[0], &proc_private[0], (int)x.size(), {
+                        ImPlotProp_LineColor, ImVec4(0.75f, 0.45f, 0.95f, 1.0f)
+                    });
+                    ImPlot::SetAxes(ImAxis_X1, ImAxis_Y3);
+                } else {
+                    ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+                }
+                ImPlot::PlotLine("Lua 内存", &x[0], &lua_mem[0], (int)x.size(), {
+                    ImPlotProp_LineColor, ImVec4(0.95f, 0.85f, 0.25f, 1.0f)
+                });
+                ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
             }
             {
                 ImPlotRect limits = ImPlot::GetPlotLimits();
@@ -1029,7 +1253,7 @@ struct Application {
             }
 
             plot_hovered = ImPlot::IsPlotHovered();
-            if (plot_hovered) {
+            if (plot_hovered && !x.empty()) {
                 double mouse_x = ImPlot::GetPlotMousePos().x;
                 size_t best = 0;
                 double best_distance = 1e100;
@@ -1048,9 +1272,24 @@ struct Application {
                                 (unsigned)x[best]);
                     ImGui::Text("Body %.2f ms  (limit %.2f)",
                                 draw[best], spike_threshold_ms);
-                    ImGui::Text("Lua wall %.2f  CPU %.2f  Lua self %.2f  C self %.2f",
+                    ImGui::Text("Lua wall %.2f  总耗时 %.2f  脚本 %.2f  C %.2f",
                                 lua_wall[best], lua_cpu[best],
                                 lua_self[best], c_self[best]);
+                    {
+                        double prev_mb = (best > 0) ? lua_mem[best - 1] : lua_mem[best];
+                        ImGui::Text("Lua 内存 %.1f MB (%+.0f KB)",
+                                    lua_mem[best],
+                                    (lua_mem[best] - prev_mb) * 1024.0);
+                    }
+                    {
+                        double prev_ws = (best > 0) ? proc_ws[best - 1] : proc_ws[best];
+                        double prev_priv = (best > 0) ? proc_private[best - 1] : proc_private[best];
+                        ImGui::Text("进程内存 %.1f MB (%+.0f KB)  专用提交 %.1f MB (%+.0f KB)",
+                                    proc_ws[best],
+                                    (proc_ws[best] - prev_ws) * 1024.0,
+                                    proc_private[best],
+                                    (proc_private[best] - prev_priv) * 1024.0);
+                    }
                     ImGui::EndTooltip();
                 }
             }
@@ -1109,108 +1348,26 @@ struct Application {
         return lhs.find(rhs) != std::string::npos;
     }
 
-    static std::string relativePathFromChunk(std::string value) {
-        std::string out;
-        size_t i = 0;
-        if (!value.empty() && (value[0] == '@' || value[0] == '='))
-            i = 1;
-        for (; i < value.size() && out.size() + 1 < 200; i++) {
-            unsigned char c = (unsigned char)value[i];
-            if (c == '/' || c == '\\' || c == ':') {
-                if (!out.empty() && out.back() != '\\') out.push_back('\\');
-                continue;
-            }
-            if (std::isalnum(c) || c == '_' || c == '-' || c == '.')
-                out.push_back((char)c);
-            else if (!out.empty() && out.back() != '\\')
-                out.push_back('_');
-        }
-        while (!out.empty() && (out.back() == '\\' || out.back() == '.')) out.pop_back();
-        auto ends_with_ci = [](const std::string &s, const char *ext) {
-            size_t n = strlen(ext);
-            if (s.size() < n) return false;
-            return _stricmp(s.c_str() + (s.size() - n), ext) == 0;
-        };
-        if (ends_with_ci(out, ".luac")) out.resize(out.size() - 5);
-        if (ends_with_ci(out, ".lua")) out.resize(out.size() - 4);
-        while (!out.empty() && (out.back() == '\\' || out.back() == '.')) out.pop_back();
-        return out.empty() ? "chunk" : out;
-    }
-
-    std::string findDumpFileForSource(const std::string &source) const {
-        char path[MAX_PATH];
-        std::string rel;
-        if (!session.ipc || !session.ipc->config.luac_dump_dir[0] || source.empty())
-            return std::string();
-        rel = relativePathFromChunk(source);
-        _snprintf(path, sizeof(path), "%s\\%s.lua",
-                  session.ipc->config.luac_dump_dir, rel.c_str());
-        path[sizeof(path) - 1] = 0;
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-            return path;
-        _snprintf(path, sizeof(path), "%s\\%s.luac.txt",
-                  session.ipc->config.luac_dump_dir, rel.c_str());
-        path[sizeof(path) - 1] = 0;
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-            return path;
-        _snprintf(path, sizeof(path), "%s\\%s.luac",
-                  session.ipc->config.luac_dump_dir, rel.c_str());
-        path[sizeof(path) - 1] = 0;
-        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-            return path;
-        return std::string();
-    }
-
     static const char *luaMethodKindName(uint16_t kind) {
         switch (kind) {
         case COCOS_DEBUG_IPC_LUA_METHOD_LUA: return "Lua";
         case COCOS_DEBUG_IPC_LUA_METHOD_C: return "C";
         case COCOS_DEBUG_IPC_LUA_METHOD_MAIN: return "main";
-        default: return "unknown";
-        }
-    }
-
-    static std::string luaMethodFlagsText(uint16_t flags) {
-        std::string text;
-        uint16_t unknown = flags;
-        if (flags & COCOS_DEBUG_IPC_LUA_METHOD_INTERNAL) {
-            text = "internal";
-            unknown &= (uint16_t)~COCOS_DEBUG_IPC_LUA_METHOD_INTERNAL;
-        }
-        if (unknown) {
-            char value[24];
-            _snprintf(value, sizeof(value), "%s0x%X",
-                      text.empty() ? "" : "|", (unsigned)unknown);
-            value[sizeof(value) - 1] = 0;
-            text += value;
-        }
-        return text.empty() ? "-" : text;
-    }
-
-    static const char *luaEventTypeName(uint8_t type) {
-        switch (type) {
-        case COCOS_DEBUG_IPC_LUA_EVENT_CALL: return "call";
-        case COCOS_DEBUG_IPC_LUA_EVENT_RETURN: return "return";
-        case COCOS_DEBUG_IPC_LUA_EVENT_TAIL_RETURN: return "tail return";
-        case COCOS_DEBUG_IPC_LUA_EVENT_RESUME: return "resume";
-        case COCOS_DEBUG_IPC_LUA_EVENT_SUSPEND: return "suspend";
-        case COCOS_DEBUG_IPC_LUA_EVENT_FRAME_BEGIN: return "frame begin";
-        case COCOS_DEBUG_IPC_LUA_EVENT_FRAME_END: return "frame end";
-        default: return "unknown";
+        default: return "未知";
         }
     }
 
     static std::string frameFlagsText(uint32_t flags) {
         struct FlagName { uint32_t bit; const char *name; };
         static const FlagName names[] = {
-            {COCOS_DEBUG_IPC_FRAME_EVENT_DROPPED, "event dropped"},
-            {COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED, "method limited"},
-            {COCOS_DEBUG_IPC_FRAME_THREAD_LIMITED, "thread limited"},
-            {COCOS_DEBUG_IPC_FRAME_LINE_LIMITED, "line limited"},
-            {COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED, "line captured"},
-            {COCOS_DEBUG_IPC_FRAME_STACK_DESYNC, "stack desync"},
-            {COCOS_DEBUG_IPC_FRAME_STATE_CONCURRENT, "state concurrent"},
-            {COCOS_DEBUG_IPC_FRAME_INTERVAL_LIMITED, "interval limited"}
+            {COCOS_DEBUG_IPC_FRAME_EVENT_DROPPED, "事件被丢弃"},
+            {COCOS_DEBUG_IPC_FRAME_METHOD_LIMITED, "方法数到上限"},
+            {COCOS_DEBUG_IPC_FRAME_THREAD_LIMITED, "线程数到上限"},
+            {COCOS_DEBUG_IPC_FRAME_LINE_LIMITED, "行采样到上限"},
+            {COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED, "已采集行"},
+            {COCOS_DEBUG_IPC_FRAME_STACK_DESYNC, "栈不同步"},
+            {COCOS_DEBUG_IPC_FRAME_STATE_CONCURRENT, "状态并发"},
+            {COCOS_DEBUG_IPC_FRAME_INTERVAL_LIMITED, "区间数到上限"}
         };
         std::string text;
         uint32_t unknown = flags;
@@ -1233,22 +1390,23 @@ struct Application {
     void renderFrameDetails() {
         const FrameSnapshot *frame = selectedFrame();
         if (!frame) return;
-        ImGui::SeparatorText("Selected frame");
-        ImGui::Text("Lua frame %u | render frame %u | DeltaTime %.3f ms | Body %.3f ms | "
-                    "events %u | trace events %u",
+        ImGui::SeparatorText("选中帧");
+        ImGui::Text("Lua 帧 %u | 渲染帧 %u | 帧间隔 %.3f ms | 主体 %.3f ms | "
+                    "事件 %u | 跟踪事件 %u",
                     frame->lua_frame_index, frame->render_frame_sequence,
                     frame->frame_period_ms, frame->drawscene_body_ms,
                     frame->hook_events, (unsigned)frame->trace_events.size());
-        ImGui::Text("Lua wall %.3f ms | CPU %.3f ms | Lua self %.3f ms | C self %.3f ms | "
-                    "outside window %.3f ms",
+        ImGui::Text("Lua 墙钟 %.3f ms | 总耗时 %.3f ms | 脚本 %.3f ms | C %.3f ms | "
+                    "窗口外 %.3f ms",
                     frame->lua_wall_ms, frame->lua_cpu_ms,
                     frame->lua_script_self_ms, frame->lua_c_self_ms,
                     frame->lua_outside_ms);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("outside window = Lua that ran in the gap before this\n"
-                              "frame's window opened. It is real Lua cost this frame\n"
-                              "has to make room for, but it is NOT inside lua_cpu\n"
-                              "and is not attributed to any method.");
+            ImGui::SetTooltip("总耗时 = 脚本 + C（由构造保证）。\n"
+                              "脚本 = Lua/main 独占；C = 从 Lua 调入的 C 函数\n"
+                              "以及 lua_pcall/lua_call/lua_resume 空栈上的 VM 开销。\n"
+                              "墙钟是多线程忙区间并集，只作参考。\n"
+                              "窗口外 = 窗口外 Lua，不进总耗时。");
         {
             /* Lua memory is the only GC-pressure signal Lua 5.1 gives us
                (no generational stats, no pause/step counters): a sawtooth is
@@ -1258,36 +1416,55 @@ struct Application {
             float previous_mem = 0.0f;
             bool has_previous = index != (size_t)-1 && index > 0;
             if (has_previous) previous_mem = history[index - 1].lua_mem_kb;
-            ImGui::Text("Lua memory %.1f KB (%+.1f KB/frame) | observer overhead ~%.3f ms "
-                        "(%u hook events)",
+            ImGui::Text("Lua 内存 %.1f KB（%+.1f KB/帧）| 观察者开销约 %.3f ms "
+                        "（%u 次 hook）",
                         frame->lua_mem_kb,
                         has_previous ? frame->lua_mem_kb - previous_mem : 0.0f,
                         (double)frame->hook_events * kHookOverheadMsPerEvent,
                         frame->hook_events);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Observer overhead is the profiler's own hook cost\n"
-                                  "(~0.23 us per event). It lands in Body, not in any\n"
-                                  "Lua metric -- subtract it before blaming Lua.");
+                ImGui::SetTooltip("观察者开销是分析器自己的 hook 成本\n"
+                                  "（每次事件约 0.23 微秒）。它算在主体里，不算进任何\n"
+                                  "Lua 指标。先扣掉它，再判断是不是 Lua 的问题。");
         }
-        ImGui::TextDisabled("frame time %.6f -> %.6f s",
+        {
+            size_t index = frameIndexOf(frame);
+            float prev_ws = 0.0f;
+            float prev_priv = 0.0f;
+            bool has_previous = index != (size_t)-1 && index > 0;
+            if (has_previous) {
+                prev_ws = history[index - 1].proc_ws_kb;
+                prev_priv = history[index - 1].proc_private_kb;
+            }
+            ImGui::Text("进程内存 %.1f MB（%+.1f KB）| 专用提交 %.1f MB（%+.1f KB）",
+                        frame->proc_ws_kb / 1024.0f,
+                        has_previous ? frame->proc_ws_kb - prev_ws : 0.0f,
+                        frame->proc_private_kb / 1024.0f,
+                        has_previous ? frame->proc_private_kb - prev_priv : 0.0f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("进程内存与任务管理器进程列表的「内存」列相同，\n"
+                                  "统计的是活动专用工作集。专用提交是私有提交量，\n"
+                                  "纹理和 C++ 分配会在这里变化。");
+        }
+        ImGui::TextDisabled("帧时间 %.6f → %.6f 秒",
                             frame->frame_begin_time_seconds,
                             frame->frame_end_time_seconds);
         if (show_spike_hints && frame->drawscene_body_ms > spike_threshold_ms) {
             ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.15f, 1.0f),
-                               "Body over budget by %.2f ms (limit %.2f)",
+                               "主体超出预算 %.2f ms（上限 %.2f）",
                                frame->drawscene_body_ms - spike_threshold_ms,
                                spike_threshold_ms);
         }
         if (frame->flags) {
             std::string flags = frameFlagsText(frame->flags);
             ImGui::TextColored(ImVec4(1, .45f, .2f, 1),
-                               "Capture flags: %s (0x%X)",
+                               "采集标记：%s（0x%X）",
                                flags.c_str(), frame->flags);
         }
-        if (ImGui::CollapsingHeader("Lua Hot Lines##frame_details",
+        if (ImGui::CollapsingHeader("Lua 热点行##frame_details",
                 frame->lua_lines.empty() ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
             if (frame->lua_lines.empty()) {
-                ImGui::TextDisabled("No line samples in this frame. Click Capture Lua details or wait for a Lua spike.");
+                ImGui::TextDisabled("本帧没有行采样。点击 Capture Lua details，或等一次 Lua 尖刺。");
             } else {
                 std::vector<size_t> line_order;
                 uint64_t total_line_samples = 0;
@@ -1303,13 +1480,13 @@ struct Application {
                         ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                         ImGuiTableFlags_Sortable,
                         ImVec2(-1, 180))) {
-                    ImGui::TableSetupColumn("Source");
-                    ImGui::TableSetupColumn("Line");
-                    ImGui::TableSetupColumn("Time ms", ImGuiTableColumnFlags_DefaultSort |
+                    ImGui::TableSetupColumn("源文件");
+                    ImGui::TableSetupColumn("行");
+                    ImGui::TableSetupColumn("耗时 ms", ImGuiTableColumnFlags_DefaultSort |
                                                        ImGuiTableColumnFlags_PreferSortDescending);
-                    ImGui::TableSetupColumn("Samples");
-                    ImGui::TableSetupColumn("Share");
-                    ImGui::TableSetupColumn("Function");
+                    ImGui::TableSetupColumn("采样次数");
+                    ImGui::TableSetupColumn("占比");
+                    ImGui::TableSetupColumn("函数");
                     ImGui::TableHeadersRow();
                     ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
                     int sort_column = 2;
@@ -1344,13 +1521,8 @@ struct Application {
                             ImGui::TableNextRow();
                             ImGui::TableNextColumn();
                             ImGui::TextUnformatted(item_source.c_str());
-                            if (ImGui::IsItemHovered()) {
-                                std::string dump = findDumpFileForSource(item_source);
-                                if (!dump.empty())
-                                    ImGui::SetTooltip("%s\nDump: %s", item_source.c_str(), dump.c_str());
-                                else
-                                    ImGui::SetTooltip("%s", item_source.c_str());
-                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", item_source.c_str());
                             ImGui::TableNextColumn(); ImGui::Text("%d", (int)item.line);
                             ImGui::TableNextColumn(); ImGui::Text("%.3f", item.line_ms);
                             ImGui::TableNextColumn(); ImGui::Text("%u", item.samples);
@@ -1367,39 +1539,51 @@ struct Application {
                     }
                     ImGui::EndTable();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Time ms is wall time on the line, including\n"
-                                          "time spent inside C calls made from it.\n"
-                                          "Samples counts VM instruction batches (1 per 4000\n"
-                                          "instructions) and is blind to C time -- sort by\n"
-                                          "Time ms, not Samples.");
+                        ImGui::SetTooltip("耗时 ms 是这一行的墙钟时间，包含从这一行调进 C 函数的时间。\n"
+                                          "采样次数按虚拟机指令批计数（每 4000 条指令一次），看不到 C 里的时间。\n"
+                                          "按耗时排序，不要按采样次数。");
                 }
             }
         }
-        ImGui::InputTextWithHint("##method_filter", "Filter Lua methods",
+        ImGui::InputTextWithHint("##method_filter", "过滤方法",
                                  method_filter, sizeof(method_filter));
+        ImGui::SameLine();
+        ImGui::RadioButton("全部", &method_kind_filter, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Lua 脚本", &method_kind_filter, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("C", &method_kind_filter, 2);
         std::vector<size_t> order;
-        for (size_t i = 0; i < frame->lua_methods.size(); i++)
+        for (size_t i = 0; i < frame->lua_methods.size(); i++) {
+            uint16_t kind = frame->lua_methods[i].kind;
+            if (method_kind_filter == 1 &&
+                kind == COCOS_DEBUG_IPC_LUA_METHOD_C)
+                continue;
+            if (method_kind_filter == 2 &&
+                kind != COCOS_DEBUG_IPC_LUA_METHOD_C)
+                continue;
             if (containsInsensitive(cocos_debug_snapshot_text(frame->lua_methods[i].name),
-                                    method_filter)) order.push_back(i);
-        if (ImGui::BeginTable("lua_methods", 10,
+                                    method_filter))
+                order.push_back(i);
+        }
+        if (ImGui::BeginTable("lua_methods", 9,
                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                 ImGuiTableFlags_Sortable | ImGuiTableFlags_ScrollX,
                 ImVec2(-1, 230))) {
-            ImGui::TableSetupColumn("Method");
-            ImGui::TableSetupColumn("Kind");
-            ImGui::TableSetupColumn("Flags");
-            ImGui::TableSetupColumn("Self ms", ImGuiTableColumnFlags_DefaultSort |
-                                               ImGuiTableColumnFlags_PreferSortDescending);
-            ImGui::TableSetupColumn("Inclusive ms");
-            ImGui::TableSetupColumn("Max self");
-            ImGui::TableSetupColumn("Max inclusive");
-            ImGui::TableSetupColumn("Started");
-            ImGui::TableSetupColumn("Completed");
-            ImGui::TableSetupColumn("Active end");
+            ImGui::TableSetupColumn("方法");
+            ImGui::TableSetupColumn("类型");
+            ImGui::TableSetupColumn("此帧总耗时", ImGuiTableColumnFlags_DefaultSort |
+                                                   ImGuiTableColumnFlags_PreferSortDescending);
+            ImGui::TableSetupColumn("含下级");
+            ImGui::TableSetupColumn("单次最大自身");
+            ImGui::TableSetupColumn("单次最大含下级");
+            ImGui::TableSetupColumn("总调用次数");
+            ImGui::TableSetupColumn("已返回");
+            ImGui::TableSetupColumn("帧末未返回");
             ImGui::TableHeadersRow();
             ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
-            int sort_column = 3;
+            int sort_column = 2;
             bool ascending = false;
             if (sort_specs && sort_specs->SpecsCount > 0) {
                 sort_column = sort_specs->Specs[0].ColumnIndex;
@@ -1413,17 +1597,16 @@ struct Application {
                 case 0: comparison = cocos_debug_snapshot_text(lhs.name).compare(
                         cocos_debug_snapshot_text(rhs.name)); break;
                 case 1: comparison = lhs.kind < rhs.kind ? -1 : lhs.kind > rhs.kind; break;
-                case 2: comparison = lhs.flags < rhs.flags ? -1 : lhs.flags > rhs.flags; break;
-                case 3: comparison = lhs.self_ms < rhs.self_ms ? -1 : lhs.self_ms > rhs.self_ms; break;
-                case 4: comparison = lhs.inclusive_ms < rhs.inclusive_ms ? -1 :
+                case 2: comparison = lhs.self_ms < rhs.self_ms ? -1 : lhs.self_ms > rhs.self_ms; break;
+                case 3: comparison = lhs.inclusive_ms < rhs.inclusive_ms ? -1 :
                                      lhs.inclusive_ms > rhs.inclusive_ms; break;
-                case 5: comparison = lhs.max_self_ms < rhs.max_self_ms ? -1 :
+                case 4: comparison = lhs.max_self_ms < rhs.max_self_ms ? -1 :
                                      lhs.max_self_ms > rhs.max_self_ms; break;
-                case 6: comparison = lhs.max_inclusive_ms < rhs.max_inclusive_ms ? -1 :
+                case 5: comparison = lhs.max_inclusive_ms < rhs.max_inclusive_ms ? -1 :
                                      lhs.max_inclusive_ms > rhs.max_inclusive_ms; break;
-                case 7: comparison = lhs.calls_started < rhs.calls_started ? -1 :
+                case 6: comparison = lhs.calls_started < rhs.calls_started ? -1 :
                                      lhs.calls_started > rhs.calls_started; break;
-                case 8: comparison = lhs.calls_completed < rhs.calls_completed ? -1 :
+                case 7: comparison = lhs.calls_completed < rhs.calls_completed ? -1 :
                                      lhs.calls_completed > rhs.calls_completed; break;
                 default: comparison = lhs.active_at_end < rhs.active_at_end ? -1 :
                                       lhs.active_at_end > rhs.active_at_end; break;
@@ -1435,12 +1618,10 @@ struct Application {
             while (clipper.Step()) {
                 for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
                     const LuaMethodSnapshot &item = frame->lua_methods[order[row]];
-                    std::string method_flags = luaMethodFlagsText(item.flags);
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(
                         cocos_debug_snapshot_text(item.name).c_str());
                     ImGui::TableNextColumn(); ImGui::TextUnformatted(luaMethodKindName(item.kind));
-                    ImGui::TableNextColumn(); ImGui::TextUnformatted(method_flags.c_str());
                     ImGui::TableNextColumn(); ImGui::Text("%.3f", item.self_ms);
                     ImGui::TableNextColumn(); ImGui::Text("%.3f", item.inclusive_ms);
                     ImGui::TableNextColumn(); ImGui::Text("%.3f", item.max_self_ms);
@@ -1452,136 +1633,72 @@ struct Application {
             }
             ImGui::EndTable();
         }
-        if (ImGui::CollapsingHeader("C++ hooks##frame_details") &&
-            ImGui::BeginTable("cpp_methods", 6,
-                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                ImGuiTableFlags_Resizable)) {
-            ImGui::TableSetupColumn("Target");
-            ImGui::TableSetupColumn("Total ms");
-            ImGui::TableSetupColumn("Max ms");
-            ImGui::TableSetupColumn("Last ms");
-            ImGui::TableSetupColumn("Calls");
-            ImGui::TableSetupColumn("Call sequence");
-            ImGui::TableHeadersRow();
-            for (size_t i = 0; i < frame->cpp_methods.size(); i++) {
-                const CppMethodSnapshot &item = frame->cpp_methods[i];
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(
-                    cocos_debug_snapshot_text(item.name).c_str());
-                ImGui::TableNextColumn(); ImGui::Text("%.3f", item.total_ms);
-                ImGui::TableNextColumn(); ImGui::Text("%.3f", item.max_ms);
-                ImGui::TableNextColumn(); ImGui::Text("%.3f", item.last_ms);
-                ImGui::TableNextColumn(); ImGui::Text("%u", item.calls);
-                ImGui::TableNextColumn(); ImGui::Text("%u", item.call_sequence);
-            }
-            ImGui::EndTable();
-        }
-        if (ImGui::CollapsingHeader("Raw Lua trace events##frame_details",
-                frame->trace_events.empty() ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (frame->trace_events.empty()) {
-                ImGui::TextDisabled("No raw events for this frame. Use Trace Start while profiling.");
-            } else if (ImGui::BeginTable("lua_trace_events", 11,
-                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
-                    ImGuiTableFlags_Resizable, ImVec2(-1, 240))) {
-                ImGui::TableSetupColumn("Event seq");
-                ImGui::TableSetupColumn("QPC");
-                ImGui::TableSetupColumn("Time s");
-                ImGui::TableSetupColumn("Frame seq");
-                ImGui::TableSetupColumn("Type");
-                ImGui::TableSetupColumn("Lua thread");
-                ImGui::TableSetupColumn("OS thread");
-                ImGui::TableSetupColumn("Depth");
-                ImGui::TableSetupColumn("Flags");
-                ImGui::TableSetupColumn("Method id");
-                ImGui::TableSetupColumn("Method");
-                ImGui::TableHeadersRow();
-                ImGuiListClipper clipper;
-                clipper.Begin((int)frame->trace_events.size());
-                while (clipper.Step()) {
-                    for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                        const LuaTraceEventSnapshot &event = frame->trace_events[(size_t)row];
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn(); ImGui::Text("%u", event.event_sequence);
-                        ImGui::TableNextColumn(); ImGui::Text("%llu",
-                            (unsigned long long)event.qpc);
-                        ImGui::TableNextColumn(); ImGui::Text("%.6f", event.time_seconds);
-                        ImGui::TableNextColumn(); ImGui::Text("%llu",
-                            (unsigned long long)event.frame_sequence);
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(
-                            luaEventTypeName(event.type));
-                        ImGui::TableNextColumn(); ImGui::Text("%u", event.lua_thread_id);
-                        ImGui::TableNextColumn(); ImGui::Text("%u", event.os_thread_id);
-                        ImGui::TableNextColumn(); ImGui::Text("%d", (int)event.depth);
-                        ImGui::TableNextColumn(); ImGui::Text("0x%02X", event.flags);
-                        ImGui::TableNextColumn(); ImGui::Text("%u", event.method_id);
-                        ImGui::TableNextColumn(); ImGui::TextUnformatted(
-                            cocos_debug_snapshot_text(event.method_name).c_str());
-                    }
-                }
-                ImGui::EndTable();
-            }
-        }
-        if (ImGui::CollapsingHeader("Engine##frame_details", ImGuiTreeNodeFlags_DefaultOpen) &&
+        if (ImGui::CollapsingHeader("引擎##frame_details", ImGuiTreeNodeFlags_DefaultOpen) &&
             ImGui::BeginTable("engine_metrics", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-            ImGui::TableSetupColumn("Metric");
+            ImGui::TableSetupColumn("指标");
             ImGui::TableSetupColumn("ms");
             ImGui::TableHeadersRow();
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("drawScene body");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("drawScene 主体");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->drawscene_body_ms);
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("DeltaTime");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("帧间隔");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->frame_period_ms);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Frame interval that contains this DrawScene:\n"
-                                  "this body + present/vsync/idle until the next\n"
-                                  "drawScene begins. Orange sits on 16.67/33 with vsync;\n"
-                                  "it is not supposed to overlay the blue Body sawtooth.");
+                ImGui::SetTooltip("包含这次 DrawScene 的帧间隔：\n"
+                                  "这次主体，加上呈现、垂直同步和空闲，直到下一次\n"
+                                  "drawScene 开始。开了垂直同步时，橙色会贴在 16.67 或 33；\n"
+                                  "它不该和蓝色的主体锯齿叠在一起。");
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("render");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("渲染");
             if (frame->scene_render_hook_present || rendererHookConfigured()) {
                 ImGui::TableNextColumn(); ImGui::Text("%.3f", sceneRenderMs(*frame));
             } else {
                 ImGui::TableNextColumn();
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "not installed");
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "未安装");
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("cc.Renderer:render was not resolved at inject time.\n"
-                                      "The green render series is not engine submit time.");
+                    ImGui::SetTooltip("注入时没有解析到 cc.Renderer:render。\n"
+                                      "绿色的渲染曲线不是引擎提交时间。");
             }
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua wall");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua 墙钟");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_wall_ms);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("各 Lua 线程忙区间的并集。\n"
+                                  "Lua 总量看总耗时（脚本 + C）。");
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua CPU");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua 总耗时");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_cpu_ms);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("总耗时 = 脚本自身 + C 自身");
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua script self");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua 脚本");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_script_self_ms);
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua C self");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("C");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_c_self_ms);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("C self / Lua CPU is the share of Lua time spent\n"
-                                  "inside C functions called from Lua. A third or more\n"
-                                  "usually means tolua bindings or iterators, not Lua.");
+                ImGui::SetTooltip("C / 总耗时 是 Lua 时间里花在\n"
+                                  "从 Lua 调入的 C 函数（绑定、标准库、迭代器）\n"
+                                  "以及空栈 VM 开销上的比例。\n"
+                                  "不是 drawScene / Renderer 这类 C++ hook。");
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua outside window");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("窗口外 Lua");
             ImGui::TableNextColumn(); ImGui::Text("%.3f", frame->lua_outside_ms);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Lua that ran in the gap before this frame's window.\n"
-                                  "Not in Lua CPU, not attributed to any method.");
+                ImGui::SetTooltip("这一帧窗口开始之前那段空隙里跑的 Lua。\n"
+                                  "不算进 Lua 总耗时，也不记到任何方法上。");
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Observer overhead (est)");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("观察者开销（估计）");
             ImGui::TableNextColumn(); ImGui::Text("%.3f",
                 (double)frame->hook_events * kHookOverheadMsPerEvent);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%u hook events x ~0.23 us. This is the profiler's\n"
-                                  "own cost and sits inside Body, so Body minus this\n"
-                                  "is what the game would cost unobserved.",
+                ImGui::SetTooltip("%u 次 hook 事件 × 约 0.23 微秒。这是分析器\n"
+                                  "自己的成本，算在主体里面，所以主体减去它\n"
+                                  "才是不插桩时游戏本来的开销。",
                                   frame->hook_events);
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua memory");
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("Lua 内存");
             {
                 size_t index = frameIndexOf(frame);
                 float previous_mem = 0.0f;
@@ -1592,10 +1709,110 @@ struct Application {
                             has_previous ? frame->lua_mem_kb - previous_mem : 0.0f);
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Lua 5.1 exposes no GC-phase stats, so total Lua\n"
-                                  "bytes is the only pressure signal: a sawtooth is a\n"
-                                  "healthy collect cycle, a monotone climb is a leak.");
+                ImGui::SetTooltip("Lua 5.1 没有分代回收统计，所以 Lua 总字节数\n"
+                                  "是唯一的压力信号：锯齿是正常回收，\n"
+                                  "一直往上爬是泄漏。");
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("进程内存");
+            {
+                size_t index = frameIndexOf(frame);
+                float previous_mem = 0.0f;
+                bool has_previous = index != (size_t)-1 && index > 0;
+                if (has_previous) previous_mem = history[index - 1].proc_ws_kb;
+                ImGui::TableNextColumn();
+                ImGui::Text("%.1f MB (%+.1f KB)", frame->proc_ws_kb / 1024.0f,
+                            has_previous ? frame->proc_ws_kb - previous_mem : 0.0f);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("与任务管理器进程列表的「内存」列相同\n"
+                                  "（活动专用工作集）。");
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted("专用提交");
+            {
+                size_t index = frameIndexOf(frame);
+                float previous_mem = 0.0f;
+                bool has_previous = index != (size_t)-1 && index > 0;
+                if (has_previous) previous_mem = history[index - 1].proc_private_kb;
+                ImGui::TableNextColumn();
+                ImGui::Text("%.1f MB (%+.1f KB)", frame->proc_private_kb / 1024.0f,
+                            has_previous ? frame->proc_private_kb - previous_mem : 0.0f);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("进程私有提交。纹理和 C++ 分配会在这里变化，\n"
+                                  "Lua 堆统计看不到。");
             ImGui::EndTable();
+        }
+
+        if (ImGui::CollapsingHeader("C++ hooks##frame_cpp", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (frame->cpp_methods.empty()) {
+                ImGui::TextDisabled("本帧没有 C++ hook 样本。"
+                                    "若上方 installed ≤ 3，请重启游戏后重新注入。");
+            } else if (ImGui::BeginTable("frame_cpp_hooks", 5,
+                                         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                             ImGuiTableFlags_Resizable |
+                                             ImGuiTableFlags_Sortable)) {
+                ImGui::TableSetupColumn("钩子");
+                ImGui::TableSetupColumn("total ms");
+                ImGui::TableSetupColumn("max ms");
+                ImGui::TableSetupColumn("last ms");
+                ImGui::TableSetupColumn("calls");
+                ImGui::TableHeadersRow();
+                std::vector<const CppMethodSnapshot *> rows;
+                rows.reserve(frame->cpp_methods.size());
+                for (size_t i = 0; i < frame->cpp_methods.size(); i++)
+                    rows.push_back(&frame->cpp_methods[i]);
+                if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsCount > 0) {
+                        const ImGuiTableColumnSortSpecs &spec = specs->Specs[0];
+                        std::sort(rows.begin(), rows.end(),
+                                  [&](const CppMethodSnapshot *lhs,
+                                      const CppMethodSnapshot *rhs) {
+                                      int comparison = 0;
+                                      switch (spec.ColumnIndex) {
+                                      case 0:
+                                          comparison =
+                                              cocos_debug_snapshot_text(lhs->name)
+                                                  .compare(cocos_debug_snapshot_text(rhs->name));
+                                          break;
+                                      case 1:
+                                          comparison = (lhs->total_ms > rhs->total_ms) -
+                                                       (lhs->total_ms < rhs->total_ms);
+                                          break;
+                                      case 2:
+                                          comparison = (lhs->max_ms > rhs->max_ms) -
+                                                       (lhs->max_ms < rhs->max_ms);
+                                          break;
+                                      case 3:
+                                          comparison = (lhs->last_ms > rhs->last_ms) -
+                                                       (lhs->last_ms < rhs->last_ms);
+                                          break;
+                                      default:
+                                          comparison = (lhs->calls > rhs->calls) -
+                                                       (lhs->calls < rhs->calls);
+                                          break;
+                                      }
+                                      return spec.SortDirection == ImGuiSortDirection_Ascending
+                                                 ? comparison < 0
+                                                 : comparison > 0;
+                                  });
+                    }
+                }
+                for (size_t i = 0; i < rows.size(); i++) {
+                    const CppMethodSnapshot &item = *rows[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(cocos_debug_snapshot_text(item.name).c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.total_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.max_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.last_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", (unsigned)item.calls);
+                }
+                ImGui::EndTable();
+            }
         }
     }
 
@@ -1707,18 +1924,18 @@ struct Application {
     }
 
     void renderCrossFramePanel() {
-        if (!ImGui::CollapsingHeader("Cross-frame analysis##cross_frame"))
+        if (!ImGui::CollapsingHeader("跨帧分析##cross_frame"))
             return;
         rebuildAggregates(false);
         ImGui::SetNextItemWidth(220.0f);
-        ImGui::SliderInt("Window (frames)##agg_window", &aggregate_window,
+        ImGui::SliderInt("窗口（帧）##agg_window", &aggregate_window,
                          60, 4000);
         ImGui::SameLine();
-        if (ImGui::Button("Refresh##agg_refresh"))
+        if (ImGui::Button("刷新##agg_refresh"))
             rebuildAggregates(true);
         ImGui::SameLine();
-        ImGui::TextDisabled("budget %.2f ms", spike_threshold_ms);
-        ImGui::Text("Frames %u | over budget %u (%.1f%%) | median quiet body %.2f ms",
+        ImGui::TextDisabled("预算 %.2f ms", spike_threshold_ms);
+        ImGui::Text("帧数 %u | 超预算 %u（%.1f%%）| 安静帧主体中位数 %.2f ms",
                     (unsigned)aggregate_frame_count,
                     (unsigned)aggregate_spike_count,
                     aggregate_frame_count
@@ -1726,14 +1943,27 @@ struct Application {
                               (double)aggregate_frame_count : 0.0,
                     aggregate_median_baseline_ms);
         if (history.empty()) {
-            ImGui::TextDisabled("No frames yet.");
+            ImGui::TextDisabled("还没有帧。");
             return;
         }
-        ImGui::InputTextWithHint("##aggregate_filter", "Filter methods",
+        ImGui::InputTextWithHint("##aggregate_filter", "过滤方法",
                                  aggregate_filter, sizeof(aggregate_filter));
+        ImGui::SameLine();
+        ImGui::RadioButton("全部##agg_kind", &method_kind_filter, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Lua 脚本##agg_kind", &method_kind_filter, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("C##agg_kind", &method_kind_filter, 2);
 
         std::vector<size_t> order;
         for (size_t i = 0; i < aggregates.size(); i++) {
+            uint16_t kind = aggregates[i].kind;
+            if (method_kind_filter == 1 &&
+                kind == COCOS_DEBUG_IPC_LUA_METHOD_C)
+                continue;
+            if (method_kind_filter == 2 &&
+                kind != COCOS_DEBUG_IPC_LUA_METHOD_C)
+                continue;
             if (containsInsensitive(cocos_debug_snapshot_text(aggregates[i].name),
                                     aggregate_filter))
                 order.push_back(i);
@@ -1745,17 +1975,17 @@ struct Application {
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                 ImGuiTableFlags_Resizable | ImGuiTableFlags_Sortable,
                 ImVec2(-1, 220))) {
-            ImGui::TableSetupColumn("Method");
-            ImGui::TableSetupColumn("Kind");
-            ImGui::TableSetupColumn("Hit frames");
-            ImGui::TableSetupColumn("Hit %");
-            ImGui::TableSetupColumn("Self total", ImGuiTableColumnFlags_DefaultSort |
-                                                  ImGuiTableColumnFlags_PreferSortDescending);
-            ImGui::TableSetupColumn("Self/hit");
-            ImGui::TableSetupColumn("p95 self");
-            ImGui::TableSetupColumn("Max self");
-            ImGui::TableSetupColumn("Incl total");
-            ImGui::TableSetupColumn("Calls");
+            ImGui::TableSetupColumn("方法");
+            ImGui::TableSetupColumn("类型");
+            ImGui::TableSetupColumn("出现帧数");
+            ImGui::TableSetupColumn("出现比例");
+            ImGui::TableSetupColumn("自身合计", ImGuiTableColumnFlags_DefaultSort |
+                                                ImGuiTableColumnFlags_PreferSortDescending);
+            ImGui::TableSetupColumn("每次出现");
+            ImGui::TableSetupColumn("p95 自身");
+            ImGui::TableSetupColumn("最大自身");
+            ImGui::TableSetupColumn("含下级合计");
+            ImGui::TableSetupColumn("调用次数");
             ImGui::TableHeadersRow();
             ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
             int sort_column = 4;
@@ -1825,10 +2055,9 @@ struct Application {
             ImGui::EndTable();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Hit frames = frames this method appears in.\n"
-                              "A method with few hits and a high p95 is a "
-                              "periodic spike, not a hot loop.\n"
-                              "Click a row to plot its self time per frame.");
+            ImGui::SetTooltip("出现帧数 = 这个方法出现过的帧数。\n"
+                              "出现得少但 p95 很高，是周期性尖刺，不是热循环。\n"
+                              "点击一行，画出它每一帧的自身耗时。");
 
         /* ---- spike attribution ---- */
         std::vector<size_t> spike_order;
@@ -1847,22 +2076,22 @@ struct Application {
             if (lhs != rhs) return lhs > rhs;
             return aggregates[a].spike_hits > aggregates[b].spike_hits;
         });
-        if (ImGui::CollapsingHeader("Spike attribution (self ms above quiet baseline)##cross_spike",
+        if (ImGui::CollapsingHeader("尖刺归因（相对安静帧的自身耗时增量）##cross_spike",
                                     ImGuiTreeNodeFlags_DefaultOpen)) {
             if (aggregate_spike_count == 0) {
-                ImGui::TextDisabled("No frame in this window exceeded %.2f ms.",
+                ImGui::TextDisabled("这个窗口里没有帧超过 %.2f ms。",
                                     spike_threshold_ms);
             } else if (ImGui::BeginTable("cross_spike_table", 6,
                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                     ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                     ImGuiTableFlags_Sortable, ImVec2(-1, 200))) {
-                ImGui::TableSetupColumn("Method");
-                ImGui::TableSetupColumn("Delta self", ImGuiTableColumnFlags_DefaultSort |
-                                                      ImGuiTableColumnFlags_PreferSortDescending);
-                ImGui::TableSetupColumn("Spike mean");
-                ImGui::TableSetupColumn("Quiet mean");
-                ImGui::TableSetupColumn("Spike hits");
-                ImGui::TableSetupColumn("Coverage");
+                ImGui::TableSetupColumn("方法");
+                ImGui::TableSetupColumn("自身增量", ImGuiTableColumnFlags_DefaultSort |
+                                                    ImGuiTableColumnFlags_PreferSortDescending);
+                ImGui::TableSetupColumn("尖刺均值");
+                ImGui::TableSetupColumn("安静均值");
+                ImGui::TableSetupColumn("尖刺帧数");
+                ImGui::TableSetupColumn("覆盖率");
                 ImGui::TableHeadersRow();
                 ImGuiTableSortSpecs *sort_specs = ImGui::TableGetSortSpecs();
                 int sort_column = 1;
@@ -1923,11 +2152,10 @@ struct Application {
                 ImGui::EndTable();
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Delta = mean self on over-budget frames minus\n"
-                                  "mean self on quiet frames. Coverage = share of\n"
-                                  "over-budget frames this method appears in.\n"
-                                  "High delta + low coverage = intermittent cause;\n"
-                                  "high delta + 100%% coverage = constant cost.");
+                ImGui::SetTooltip("增量 = 超预算帧上的平均自身耗时，减去安静帧上的平均自身耗时。\n"
+                                  "覆盖率 = 这个方法出现在多少比例的超预算帧里。\n"
+                                  "增量大且覆盖率低 = 间歇性原因；\n"
+                                  "增量大且覆盖率 100%% = 固定成本。");
         }
 
         /* ---- per-method curve ---- */
@@ -1935,16 +2163,16 @@ struct Application {
         if (selected_method_id && !ts_x.empty()) {
             ImGui::TextUnformatted(selected_method_label.c_str());
             ImGui::SameLine();
-            if (ImGui::Button("Clear##ts_clear"))
+            if (ImGui::Button("清除##ts_clear"))
                 selectMethod(0, 0);
-            if (ImPlot::BeginPlot("method self##cross_ts", ImVec2(-1, 200))) {
-                ImPlot::SetupAxes("frame", "ms");
-                ImPlot::PlotLine("body", &ts_x[0], &ts_body[0], (int)ts_x.size());
-                ImPlot::PlotLine("self", &ts_x[0], &ts_y[0], (int)ts_x.size());
+            if (ImPlot::BeginPlot("方法自身##cross_ts", ImVec2(-1, 200))) {
+                ImPlot::SetupAxes("帧", "ms");
+                ImPlot::PlotLine("主体", &ts_x[0], &ts_body[0], (int)ts_x.size());
+                ImPlot::PlotLine("自身", &ts_x[0], &ts_y[0], (int)ts_x.size());
                 ImPlot::EndPlot();
             }
         } else if (!selected_method_id) {
-            ImGui::TextDisabled("Select a method above to plot its self time per frame.");
+            ImGui::TextDisabled("在上面选一个方法，画出它每一帧的自身耗时。");
         }
     }
 
@@ -2557,7 +2785,6 @@ struct Application {
         pollTelemetry();
         pollLuaEditorResult();
         pollDebugListHotkeys();
-        dockWindow();
         ImGuiViewport *viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(viewport->WorkPos);
         ImGui::SetNextWindowSize(viewport->WorkSize);

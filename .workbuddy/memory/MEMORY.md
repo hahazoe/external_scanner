@@ -17,7 +17,7 @@ viewer（debugview.exe，ImGui/DX9）注入 DLL 到目标进程，经共享内�
   输出 `*> log.txt` 再转码 Read。测试桩需 `-DCOCOS_DEBUG_LUA_PROFILER_TESTING`。
 
 ## 代码约定（改代码时遵守）
-- 三处 hook（injected_runtime / lua_api_hooks / luac_dump）共用 `common/x86_insn.h`
+- injected_runtime / lua_api_hooks 共用 `common/x86_insn.h`
   的解码与重定位；新增 hook 不要再复制解码器。
 - 打补丁必须包 `injection/patch_freeze.h` 的 freeze_begin/end，VirtualAlloc 必须在 freeze 之前。
 - 遇到 EB/jcc 短跳转要拒绝安装（x86_reloc_copy 返回 0），不能静默写坏。
@@ -29,7 +29,7 @@ viewer（debugview.exe，ImGui/DX9）注入 DLL 到目标进程，经共享内�
   `script_qpc` 或 `c_qpc`、`top->frame_self_qpc` 和方法 acc 的 `self_qpc`。"丢弃时间"的路径
   （如 `lp_drop_frames_locked`）要转移而非删除，保持 `sum(method self)==lua_cpu` 且
   `script + c == cpu` —— lua51 集成测试会断言这两条。
-- 目标样本 sealapp.exe；luac dump 在 `<debugview.exe 目录>/luac_dump/<进程名>/`。
+- 目标样本 sealapp.exe；对照明文用 `E:/YZST_lua_decrypted`。
 
 ## lua_profiler 失真点（2026-09-18 审计）
 ### 已修（有回归测试 + 反向验证）
@@ -69,6 +69,15 @@ viewer（debugview.exe，ImGui/DX9）注入 DLL 到目标进程，经共享内�
 - 回归测试：`tests/lua_profiler_core_test.c`（two_root_calls_in_one_frame / protected_error_unwind）、
   `tests/lua_profiler_lua51_test.c`（真 Lua + 真 pcall hook 出错续跑）、
   `tests/ipc_selftest.c`（899 字符长 key 去重）。
+
+## 崩溃栈分析工具链（与逐帧 profiler 无关的另一条线）
+- `analyze_dump_stack.py`：用 Breakpad `.sym` 符号化**单条** dump.log（支持 GUI/CLI 两用）。
+  `analyze_dump_stack_gui.py` 是 tkinter 窗口，frozen 时用 `sys.executable` 自调 + CLI 参数转 `engine.main()`。
+- `scripts/parse_crash_md.py`：批量解析飞书《PC崩溃通知》md（多条「PC宕机上报」），
+  复用上面引擎符号化 → 按「异常码+前6层符号」聚合 → python-docx 出 Word 报告。
+  用法见 skill `~/.workbuddy/skills/crash-md-report/`。
+- 符号包 `breakpad_syms.zip` 是 WinZip AES（压缩方法 99），密码 `SealBreakpadSym`，必须 `pyzipper` 解。
+- 托管 venv `C:\Users\xuhao2\.workbuddy\binaries\python\envs\default` 已装 python-docx、pyzipper。
 
 ## 目标样本 sealapp 的已知反模式
 详见 `.workbuddy/memory/sealapp-antipatterns.md`（内容多，单独文件）。

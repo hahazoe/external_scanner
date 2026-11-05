@@ -219,7 +219,6 @@ miss 级联判据仍然成立：`getPanelName` 243675 次 ≈ **1.96 ×** `getPa
 
 **依据**：`[C]:tostring`(incl) ⊇ `text_format.luac:71:format`(incl)，两者调用数相等（12）；
 `protobuf.luac:604:Lua:<anonymous>` 夹在二者之间（20 帧累计 incl 164.05ms）。
-**无法直接阅读**：`protobuf.lua` 不在 `build/luac_dump/sealapp/` 也不在
-`build/generated/luac_dump/sealapp/` 中（未被 dump），`protobuf.luac:604` 源码拿不到。
+**无法直接阅读**：`protobuf.lua` 不在 `E:/YZST_lua_decrypted` 中，`protobuf.luac:604` 源码拿不到。
 **验证方法**：在 `dump()` 里临时加 `if type(v)=="userdata" then print(debug.traceback()) end`；
 或下次录制开启 trace 事件流后用 `trace_analysis.py` 直接读 `text_format` 的调用方。

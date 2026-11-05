@@ -12,6 +12,7 @@
 typedef int (__cdecl *LuaResumeFn)(lua_State *, int);
 typedef lua_State *(__cdecl *LuaNewThreadFn)(lua_State *);
 typedef int (__cdecl *LuaPcallFn)(lua_State *, int, int, int);
+typedef void (__cdecl *LuaCallFn)(lua_State *, int, int);
 
 typedef struct ApiHook {
     uint8_t *target;
@@ -23,9 +24,11 @@ typedef struct ApiHook {
 static ApiHook g_resume_hook;
 static ApiHook g_newthread_hook;
 static ApiHook g_pcall_hook;
+static ApiHook g_call_hook;
 static LuaResumeFn g_resume_original;
 static LuaNewThreadFn g_newthread_original;
 static LuaPcallFn g_pcall_original;
+static LuaCallFn g_call_original;
 
 static int install_hook(ApiHook *hook, void *target_address,
                         void *replacement) {
@@ -116,9 +119,18 @@ static int __cdecl hook_lua_pcall(lua_State *L, int nargs, int nresults,
     return result;
 }
 
+/* lua_call does not catch errors.  If the call throws, this leave is skipped
+   and the enclosing pcall restores C-API depth from its saved base. */
+static void __cdecl hook_lua_call(lua_State *L, int nargs, int nresults) {
+    cocos_debug_lua_profiler_call_enter(L);
+    g_call_original(L, nargs, nresults);
+    cocos_debug_lua_profiler_call_leave(L);
+}
+
 int cocos_debug_lua_api_hooks_install(void *lua_resume_address,
                                void *lua_newthread_address,
-                               void *lua_pcall_address) {
+                               void *lua_pcall_address,
+                               void *lua_call_address) {
     int installed = 0;
     if (lua_resume_address &&
         install_hook(&g_resume_hook, lua_resume_address,
@@ -138,13 +150,21 @@ int cocos_debug_lua_api_hooks_install(void *lua_resume_address,
         g_pcall_original = (LuaPcallFn)g_pcall_hook.trampoline;
         installed |= 4;
     }
+    if (lua_call_address &&
+        install_hook(&g_call_hook, lua_call_address,
+                     (void *)hook_lua_call)) {
+        g_call_original = (LuaCallFn)g_call_hook.trampoline;
+        installed |= 8;
+    }
     return installed;
 }
 
 void cocos_debug_lua_api_hooks_remove(void) {
+    remove_hook(&g_call_hook);
     remove_hook(&g_pcall_hook);
     remove_hook(&g_newthread_hook);
     remove_hook(&g_resume_hook);
+    g_call_original = NULL;
     g_pcall_original = NULL;
     g_newthread_original = NULL;
     g_resume_original = NULL;

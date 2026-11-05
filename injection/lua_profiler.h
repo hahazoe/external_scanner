@@ -72,6 +72,13 @@ int cocos_debug_lua_profiler_protected_enter(lua_State *L);
 void cocos_debug_lua_profiler_protected_leave(lua_State *L, int tracked,
                                               int status);
 
+/* lua_call boundary.  Unlike pcall, lua_call does not catch errors -- a
+   throw longjmps to the enclosing pcall and this leave is skipped.  The
+   calls only maintain C-API nesting so empty-stack VM time inside a call
+   from C can be classified as C, not dropped. */
+void cocos_debug_lua_profiler_call_enter(lua_State *L);
+void cocos_debug_lua_profiler_call_leave(lua_State *L);
+
 void cocos_debug_lua_profiler_set_line_capture(int enabled);
 void cocos_debug_lua_profiler_set_trace(int enabled);
 int cocos_debug_lua_profiler_trace_enabled(void);

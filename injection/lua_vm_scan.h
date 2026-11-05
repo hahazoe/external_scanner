@@ -14,10 +14,13 @@ typedef void (*CocosDebugScanProgressFn)(int percent, const char *stage);
 int cocos_debug_collect_lua_modules(DWORD pid);
 int cocos_debug_lua_module_count(void);
 int cocos_debug_address_in_lua_module(uintptr_t address);
+/* Non-zero after a successful collect+detect when the Lua module exports LuaJIT. */
+int cocos_debug_lua_is_luajit(void);
 
 /*
- * Scan committed RW memory for a Lua 5.1 global_State, then pick a live
- * lua_State (preferring the main thread, status==0).
+ * Scan committed RW memory for a live main lua_State.
+ * Supports PUC-Rio Lua 5.1 (global_State heuristic) and LuaJIT 2.x
+ * (lua_State + mainthref). Preferring the idle main thread (status==0).
  */
 int cocos_debug_scan_lua_state(HANDLE process, uint32_t *out_state,
                         CocosDebugScanProgressFn progress);

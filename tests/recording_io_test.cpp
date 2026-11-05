@@ -29,6 +29,14 @@ static void write_u64(FILE *fp, uint64_t value) {
     write_raw(fp, &value, sizeof(value));
 }
 
+static void write_f32(FILE *fp, float value) {
+    write_raw(fp, &value, sizeof(value));
+}
+
+static void write_f64(FILE *fp, double value) {
+    write_raw(fp, &value, sizeof(value));
+}
+
 static void test_round_trip(const char *path) {
     std::deque<FrameSnapshot> input;
     std::deque<FrameSnapshot> output;
@@ -54,6 +62,11 @@ static void test_round_trip(const char *path) {
     frame.lua_mem_kb = 2048.0f;
     frame.hook_events = 123;
     frame.flags = COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED;
+    frame.actor_x = 128.5f;
+    frame.actor_y = -64.25f;
+    frame.actor_valid = 1;
+    frame.proc_ws_kb = 512000.0f;
+    frame.proc_private_kb = 480000.0f;
 
     method.name = cocos_debug_pool_intern("foo.lua:10:Lua:update");
     method.kind = COCOS_DEBUG_IPC_LUA_METHOD_LUA;
@@ -118,6 +131,13 @@ static void test_round_trip(const char *path) {
         CHECK(loaded.trace_events.size() == 1 &&
               loaded.trace_events[0].event_sequence == event.event_sequence,
               "trace events");
+        CHECK(loaded.actor_valid == 1 &&
+              loaded.actor_x == frame.actor_x &&
+              loaded.actor_y == frame.actor_y,
+              "actor position");
+        CHECK(loaded.proc_ws_kb == frame.proc_ws_kb &&
+              loaded.proc_private_kb == frame.proc_private_kb,
+              "process memory");
     }
 }
 
@@ -142,6 +162,48 @@ static void test_old_version_rejected(const char *path) {
           "old version error message");
 }
 
+static void test_v7_process_memory_defaults(const char *path) {
+    static const char magic[8] =
+        {'C', 'C', 'D', 'B', 'R', 'E', 'C', '1'};
+    std::deque<FrameSnapshot> frames;
+    std::string error;
+    FILE *fp = fopen(path, "wb");
+    write_raw(fp, magic, sizeof(magic));
+    write_u32(fp, 7);
+    write_u64(fp, 1);
+    write_u64(fp, 3);
+    write_f64(fp, 1.0);
+    write_f64(fp, 1.016);
+    write_u32(fp, 1);
+    write_u32(fp, 1);
+    write_f32(fp, 16.0f);
+    write_f32(fp, 4.0f);
+    write_f32(fp, 2.0f);
+    write_f32(fp, 2.0f);
+    write_f32(fp, 1.0f);
+    write_f32(fp, 1.0f);
+    write_f32(fp, 1.0f);
+    write_f32(fp, 1024.0f);
+    write_u32(fp, 0);
+    write_u32(fp, 0);
+    write_f32(fp, 10.0f);
+    write_f32(fp, 20.0f);
+    write_u32(fp, 1);
+    write_u32(fp, 0);
+    write_u32(fp, 0);
+    write_u32(fp, 0);
+    write_u32(fp, 0);
+    write_u32(fp, 0);
+    fclose(fp);
+    CHECK(cocos_debug_load_recording(path, &frames, NULL, &error),
+          "v7 recording loads");
+    CHECK(frames.size() == 1 &&
+          frames[0].actor_valid == 1 &&
+          frames[0].proc_ws_kb == 0.0f &&
+          frames[0].proc_private_kb == 0.0f,
+          "v7 process memory defaults to 0");
+}
+
 static void test_bad_magic(const char *path) {
     std::deque<FrameSnapshot> frames;
     std::string error;
@@ -155,12 +217,15 @@ static void test_bad_magic(const char *path) {
 int main(void) {
     const char *current = "build\\generated\\recording_current_test.cocosdbg";
     const char *old = "build\\generated\\recording_old_test.cocosdbg";
+    const char *v7 = "build\\generated\\recording_v7_test.cocosdbg";
     const char *bad = "build\\generated\\recording_bad_test.cocosdbg";
     test_round_trip(current);
     test_old_version_rejected(old);
+    test_v7_process_memory_defaults(v7);
     test_bad_magic(bad);
     DeleteFileA(current);
     DeleteFileA(old);
+    DeleteFileA(v7);
     DeleteFileA(bad);
     if (g_failures) {
         fprintf(stderr, "[FAIL] %d recording assertions\n", g_failures);

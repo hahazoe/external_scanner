@@ -1,0 +1,5 @@
+# Keep UART console on USB-UART bridge (COM4) for logs.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# TinyUSB HID mouse (native USB-OTG port)
+CONFIG_TINYUSB_HID_COUNT=1

@@ -1,7 +1,7 @@
 /*
  * Shared x86 (32-bit) instruction length decoding + prologue relocation
- * for inline hooks. Single implementation used by injected_runtime.c,
- * lua_api_hooks.c and luac_dump.c.
+ * for inline hooks. Single implementation used by injected_runtime.c
+ * and lua_api_hooks.c.
  *
  * Coverage is intentionally conservative: unknown opcodes return 0 and
  * hook installation fails instead of writing a corrupt trampoline.

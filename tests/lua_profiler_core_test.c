@@ -63,6 +63,31 @@ static const CocosDebugIpcMethodSample *find_method(
     return NULL;
 }
 
+static void expect_identity(const char *name,
+                            const CocosDebugLuaProfilerFrame *frame) {
+    char label[128];
+    double script_sum = 0.0;
+    double c_sum = 0.0;
+    double all = 0.0;
+    uint32_t i;
+    _snprintf(label, sizeof(label), "%s.cpu=script+c", name);
+    expect_close(label, frame->lua_cpu_ms,
+                 frame->lua_script_self_ms + frame->lua_c_self_ms);
+    for (i = 0; i < frame->method_count; i++) {
+        all += frame->methods[i].self_ms;
+        if (frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_C)
+            c_sum += frame->methods[i].self_ms;
+        else
+            script_sum += frame->methods[i].self_ms;
+    }
+    _snprintf(label, sizeof(label), "%s.method self sum", name);
+    expect_close(label, all, frame->lua_cpu_ms);
+    _snprintf(label, sizeof(label), "%s.lua method self", name);
+    expect_close(label, script_sum, frame->lua_script_self_ms);
+    _snprintf(label, sizeof(label), "%s.c method self", name);
+    expect_close(label, c_sum, frame->lua_c_self_ms);
+}
+
 static void reset_profiler(void) {
     cocos_debug_lua_profiler_stop();
     cocos_debug_lua_profiler_start();
@@ -95,14 +120,7 @@ static void test_nested_calls(void) {
     expect_close("nested.cpu", frame.lua_cpu_ms, 40.0);
     expect_close("nested.script", frame.lua_script_self_ms, 40.0);
     expect_close("nested.c", frame.lua_c_self_ms, 0.0);
-    {
-        double method_self = 0.0;
-        uint32_t i;
-        for (i = 0; i < frame.method_count; i++)
-            method_self += frame.methods[i].self_ms;
-        expect_close("nested.method self sum", method_self,
-                     frame.lua_cpu_ms);
-    }
+    expect_identity("nested", &frame);
     if (!a || !b) {
         fprintf(stderr, "[FAIL] nested methods missing\n");
         g_failures++;
@@ -136,6 +154,8 @@ static void test_lua_and_c_split(void) {
     expect_close("split.cpu", frame.lua_cpu_ms, 50.0);
     expect_close("split.script", frame.lua_script_self_ms, 20.0);
     expect_close("split.c", frame.lua_c_self_ms, 30.0);
+    expect_close("split.wall", frame.lua_wall_ms, 50.0);
+    expect_identity("split", &frame);
 }
 
 static void test_yield_and_cross_frame(void) {
@@ -156,6 +176,7 @@ static void test_yield_and_cross_frame(void) {
     a = find_method(&first, 1);
     expect_close("yield.first.wall", first.lua_wall_ms, 10.0);
     expect_close("yield.first.cpu", first.lua_cpu_ms, 10.0);
+    expect_identity("yield.first", &first);
     if (!a) {
         fprintf(stderr, "[FAIL] yield first method missing\n");
         g_failures++;
@@ -173,6 +194,7 @@ static void test_yield_and_cross_frame(void) {
     a = find_method(&second, 1);
     expect_close("yield.second.wall", second.lua_wall_ms, 20.0);
     expect_close("yield.second.cpu", second.lua_cpu_ms, 20.0);
+    expect_identity("yield.second", &second);
     if (!a) {
         fprintf(stderr, "[FAIL] yield second method missing\n");
         g_failures++;
@@ -206,6 +228,7 @@ static void test_concurrent_union(void) {
     expect_close("union.wall", frame.lua_wall_ms, 70.0);
     expect_close("union.cpu", frame.lua_cpu_ms, 110.0);
     expect_close("union.script", frame.lua_script_self_ms, 110.0);
+    expect_identity("union", &frame);
 }
 
 static void test_frame_outside_excluded(void) {
@@ -224,6 +247,7 @@ static void test_frame_outside_excluded(void) {
     a = find_method(&frame, 1);
     expect_close("outside.wall", frame.lua_wall_ms, 20.0);
     expect_close("outside.cpu", frame.lua_cpu_ms, 20.0);
+    expect_identity("outside", &frame);
     if (!a) {
         fprintf(stderr, "[FAIL] outside method missing\n");
         g_failures++;
@@ -264,19 +288,7 @@ static void test_resume_does_not_double_count_parent(void) {
     expect_close("resume-parent.cpu", frame.lua_cpu_ms, 70.0);
     expect_close("resume-parent.script", frame.lua_script_self_ms, 50.0);
     expect_close("resume-parent.c", frame.lua_c_self_ms, 20.0);
-}
-
-static void expect_method_self_sum(const char *name,
-                                   const CocosDebugLuaProfilerFrame *frame) {
-    double method_self = 0.0;
-    uint32_t i;
-    for (i = 0; i < frame->method_count; i++)
-        method_self += frame->methods[i].self_ms;
-    if (fabs(method_self - frame->lua_cpu_ms) > 0.001) {
-        fprintf(stderr, "[FAIL] %s: method self sum %.6f != lua_cpu %.6f\n",
-                name, method_self, frame->lua_cpu_ms);
-        g_failures++;
-    }
+    expect_identity("resume-parent", &frame);
 }
 
 /* Regression: two root calls in one frame.  The second used to latch the
@@ -305,7 +317,7 @@ static void test_two_root_calls_in_one_frame(void) {
     expect_close("root2.wall", frame.lua_wall_ms, 40.0);
     expect_close("root2.cpu", frame.lua_cpu_ms, 40.0);
     expect_close("root2.script", frame.lua_script_self_ms, 40.0);
-    expect_method_self_sum("root2", &frame);
+    expect_identity("root2", &frame);
     a = find_method(&frame, 1);
     b = find_method(&frame, 2);
     if (!a || !b) {
@@ -371,7 +383,7 @@ static void test_protected_error_unwind(void) {
     expect_close("unwind.cpu", frame.lua_cpu_ms, 90.0);
     expect_close("unwind.script", frame.lua_script_self_ms, 70.0);
     expect_close("unwind.c", frame.lua_c_self_ms, 20.0);
-    expect_method_self_sum("unwind", &frame);
+    expect_identity("unwind", &frame);
     pcall_method = find_method(&frame, 1);
     chain_root = find_method(&frame, 2);
     dead_inner = find_method(&frame, 3);
@@ -384,13 +396,17 @@ static void test_protected_error_unwind(void) {
     expect_close("unwind.pcall.self", pcall_method->self_ms, 20.0);
     expect_close("unwind.pcall.inclusive", pcall_method->inclusive_ms, 70.0);
     expect_u32("unwind.pcall.completed", pcall_method->calls_completed, 1);
-    /* The outermost dead frame keeps the time; the inner one is folded in. */
-    expect_close("unwind.chain.self", chain_root->self_ms, 50.0);
+    /* Each dead frame keeps the time it actually ran; we no longer fold
+       inner self into the outer method (that mixed C vs Lua). */
+    expect_close("unwind.chain.self", chain_root->self_ms, 20.0);
     expect_close("unwind.chain.inclusive", chain_root->inclusive_ms, 0.0);
     expect_u32("unwind.chain.started", chain_root->calls_started, 1);
     expect_u32("unwind.chain.completed", chain_root->calls_completed, 0);
-    if (dead_inner) {
-        expect_close("unwind.inner.self", dead_inner->self_ms, 0.0);
+    if (!dead_inner) {
+        fprintf(stderr, "[FAIL] unwind inner method missing\n");
+        g_failures++;
+    } else {
+        expect_close("unwind.inner.self", dead_inner->self_ms, 30.0);
         expect_close("unwind.inner.inclusive", dead_inner->inclusive_ms, 0.0);
     }
     expect_close("unwind.after.inclusive", after->inclusive_ms, 20.0);
@@ -419,6 +435,7 @@ static void test_outside_window_lua(void) {
     cocos_debug_lua_profiler_frame_end(&first);
     expect_close("outside.first.cpu", first.lua_cpu_ms, 20.0);
     expect_close("outside.first.outside", first.lua_outside_ms, 0.0);
+    expect_identity("outside.first", &first);
 
     g_clock = 9040;
     /* The Lua run finishes in the gap: 20 ticks with no window open. */
@@ -432,6 +449,45 @@ static void test_outside_window_lua(void) {
     expect_close("outside.second.cpu", second.lua_cpu_ms, 0.0);
     expect_u32("outside.second.methods", second.method_count, 0);
     expect_close("outside.second.body", second.body_ms, 10.0);
+    expect_identity("outside.second", &second);
+}
+
+static void test_empty_stack_vm_is_c(void) {
+    lua_State *L = (lua_State *)(uintptr_t)0xc0000;
+    CocosDebugLuaProfilerFrame frame;
+    const CocosDebugIpcMethodSample *lua_fn;
+    const CocosDebugIpcMethodSample *vm;
+    reset_profiler();
+    cocos_debug_lua_profiler_register_thread(L);
+    g_clock = 10000;
+    cocos_debug_lua_profiler_frame_begin(12);
+    cocos_debug_lua_profiler_call_enter(L);
+    g_clock = 10020;
+    cocos_debug_lua_profiler_test_call(
+        L, 1, COCOS_DEBUG_IPC_LUA_METHOD_LUA, 0);
+    g_clock = 10050;
+    cocos_debug_lua_profiler_test_return(L, 0);
+    g_clock = 10060;
+    cocos_debug_lua_profiler_call_leave(L);
+    g_clock = 10070;
+    cocos_debug_lua_profiler_frame_end(&frame);
+    expect_close("vm.body", frame.body_ms, 70.0);
+    expect_close("vm.cpu", frame.lua_cpu_ms, 60.0);
+    expect_close("vm.script", frame.lua_script_self_ms, 30.0);
+    expect_close("vm.c", frame.lua_c_self_ms, 30.0);
+    expect_close("vm.wall", frame.lua_wall_ms, 60.0);
+    expect_identity("vm", &frame);
+    lua_fn = find_method(&frame, 1);
+    vm = find_method(&frame, COCOS_DEBUG_IPC_METHOD_DICT_CAP);
+    if (!lua_fn || !vm) {
+        fprintf(stderr, "[FAIL] vm methods missing lua=%p vm=%p\n",
+                (const void *)lua_fn, (const void *)vm);
+        g_failures++;
+        return;
+    }
+    expect_close("vm.lua.self", lua_fn->self_ms, 30.0);
+    expect_close("vm.bucket.self", vm->self_ms, 30.0);
+    expect_u32("vm.bucket.kind", vm->kind, COCOS_DEBUG_IPC_LUA_METHOD_C);
 }
 
 int main(void) {
@@ -455,6 +511,7 @@ int main(void) {
     test_two_root_calls_in_one_frame();
     test_protected_error_unwind();
     test_outside_window_lua();
+    test_empty_stack_vm_is_c();
     cocos_debug_lua_profiler_shutdown();
     if (g_failures) {
         fprintf(stderr, "[FAIL] %d assertions\n", g_failures);

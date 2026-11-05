@@ -41,6 +41,8 @@ def main():
     lines = {}
     cpp = {}
     frames = []
+    proc_ws_kb = []
+    proc_private_kb = []
 
     for fr in iter_frames(path):
         frame_methods = []
@@ -73,6 +75,8 @@ def main():
         for ln in fr["lua_lines"]:
             key = (ln["source"], ln["function_name"], ln["line"])
             lines[key] = lines.get(key, 0) + ln["samples"]
+        proc_ws_kb.append(fr.get("proc_ws_kb", 0.0) or 0.0)
+        proc_private_kb.append(fr.get("proc_private_kb", 0.0) or 0.0)
         frames.append((fr["period_ms"], fr["wall_ms"], fr["cpu_ms"],
                        fr["script_ms"], fr["c_ms"], fr["mem_kb"],
                        fr["drawscene_ms"], fr["publish_sequence"],
@@ -100,6 +104,8 @@ def main():
     w(stats_line("lua_script_self", [x[3] for x in frames]))
     w(stats_line("lua_c_self    ", [x[4] for x in frames]))
     w(stats_line("lua_mem_kb    ", [x[5] for x in frames]))
+    w(stats_line("proc_ws_kb    ", proc_ws_kb))
+    w(stats_line("proc_private_kb", proc_private_kb))
     w("total recorded time: %.2f s" % (sum(periods) / 1000.0))
     w("sum lua_wall: %.2f s  sum lua_cpu: %.2f s" %
       (sum(x[1] for x in frames) / 1000.0, sum(x[2] for x in frames) / 1000.0))

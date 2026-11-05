@@ -1,4 +1,19 @@
 build/
 temp/
+dist/
+__pycache__/
+.tmp_cursor_query/
 *.dll
 *.o
+
+# ESP-IDF (esp32s3/)
+esp32s3/build/
+esp32s3/sdkconfig
+esp32s3/sdkconfig.old
+esp32s3/dependencies.lock
+esp32s3/managed_components/
+eim_install.log
+eim.log
+idf_tools_install.log
+idf_python_env.log
+idf_riscv_install.log

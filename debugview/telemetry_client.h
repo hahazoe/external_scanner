@@ -92,12 +92,20 @@ struct FrameSnapshot {
        the old drawScene-scoped window used to throw away. */
     float lua_outside_ms;
     float lua_mem_kb;
+    /* proc_ws_kb matches Task Manager's Memory column (private working set).
+       proc_private_kb is private commit. Both in KB; 0 on older recordings. */
+    float proc_ws_kb;
+    float proc_private_kb;
     /* Hook events observed.  Multiplied by ~0.23us this is the observer's own
        cost, which lands in body_ms and not in any Lua metric. */
     uint32_t hook_events;
     uint32_t flags;
     float scene_render_ms;
     bool scene_render_hook_present;
+    /* Legacy v7 fields; sampling removed. Always 0 on new captures. */
+    float actor_x;
+    float actor_y;
+    uint32_t actor_valid;
     std::vector<LuaMethodSnapshot> lua_methods;
     std::vector<CppMethodSnapshot> cpp_methods;
     std::vector<LuaLineSnapshot> lua_lines;
@@ -109,9 +117,10 @@ struct FrameSnapshot {
           render_frame_sequence(0), frame_period_ms(0),
           drawscene_body_ms(0), lua_wall_ms(0), lua_cpu_ms(0),
           lua_script_self_ms(0), lua_c_self_ms(0), lua_outside_ms(0),
-          lua_mem_kb(0),
+          lua_mem_kb(0), proc_ws_kb(0), proc_private_kb(0),
           hook_events(0), flags(0), scene_render_ms(0),
-          scene_render_hook_present(false) {}
+          scene_render_hook_present(false),
+          actor_x(0), actor_y(0), actor_valid(0) {}
 };
 
 inline void cocos_debug_fill_scene_render(FrameSnapshot *frame) {

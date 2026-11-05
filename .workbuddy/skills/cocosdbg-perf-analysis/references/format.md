@@ -1,13 +1,13 @@
-# .cocosdbg 录制格式参考（version 5 与 6）
+# .cocosdbg 录制格式参考（version 5 到 8）
 
 格式权威来源：`debugview/recording_io.cpp`（kMagic `CCDBREC1`）。全部小端序。
-当前写出的版本是 **6**；读取端必须同时接受 5 和 6（v5 文件里 v6 的新字段视为 0）。
+当前写出的版本是 **8**；读取端必须同时接受 5、6、7、8（旧文件里较新的字段视为 0）。
 
 ## 文件布局
 
 ```
 magic     8 bytes  "CCDBREC1"
-version   u32      = 5 或 6
+version   u32      = 5、6、7 或 8
 count     u64      帧数
 frames    count × Frame
 img_cnt   u32      预览图数量（可忽略，分析时读到帧结束即可）
@@ -18,6 +18,14 @@ images    img_cnt × Image
 读错了整帧会错位）：
 1. Frame 头在 `lua_c_self_ms` 之后插入 `lua_outside_ms(f32)`。
 2. 行采样在 `samples(u32)` 之后追加 `line_ms(f32)`。
+
+**version 7 相对 6**：Frame 头在 `flags` 之后、四个 count 之前插入
+`actor_x(f32) actor_y(f32) actor_valid(u32)`。曾用于主角像素坐标，现已停采，
+新录制恒为 0；旧文件仍可读。v6 及更早读出来这三个字段为 0。
+
+**version 8 相对 7**：Frame 头在 `actor_valid` 之后、四个 count 之前插入
+`proc_ws_kb(f32) proc_private_kb(f32)`。`proc_ws_kb` 是任务管理器进程列表「内存」列的活动专用工作集，`proc_private_kb` 是私有提交，单位都是 KB。
+v7 及更早读出来这两个字段为 0。
 
 字符串统一为 `u32 长度 + 字节`（UTF-8，最长 1MB）。
 
@@ -39,6 +47,11 @@ images    img_cnt × Image
 | lua_mem_kb | f32 | Lua 堆 KB |
 | hook_events | u32 | |
 | flags | u32 | |
+| actor_x | f32 | **仅 v7**：遗留字段，新录制恒 0 |
+| actor_y | f32 | **仅 v7**：遗留字段，新录制恒 0 |
+| actor_valid | u32 | **仅 v7**：遗留字段，新录制恒 0 |
+| proc_ws_kb | f32 | **仅 v8**：活动专用工作集 KB，与任务管理器「内存」列相同 |
+| proc_private_kb | f32 | **仅 v8**：进程私有提交 KB |
 | lua_count | u32 | LuaMethod 数 |
 | cpp_count | u32 | CppMethod 数 |
 | line_count | u32 | 行采样数 |
@@ -125,13 +138,8 @@ type（见 common/profiler_ipc.h）：
 ## 方法名 → 源码定位
 
 - profiler 名 `[string "app/xxx/yyy.luac"]:NNN:` 中的 NNN 是**已加载 chunk 的行号**，
-  与 luac dump 出的明文 `.lua` 行号 1:1 对应（dump 就是运行时 loadbuffer 的原文）。
-- 磁盘上的 `.luac`（E:\YZST 等）是加密容器（头 `YSZTMB2CP!`，密钥流无短周期，
-  已知明文攻击无效），**不要**试图离线解密，直接用 dump 的明文。
-- dump 目录有两个：
-  - `build/luac_dump/sealapp/` —— 早期会话完整 dump（含 app/scene、main、text_format 等启动期文件）
-  - `build/generated/luac_dump/sealapp/` —— 晚期会话 dump（仅 hook 安装后加载的文件，缺核心文件）
-  - 找不到文件时先查两处的 `luac_dump_map.tsv`（chunk 名 → 明文路径映射）。
+  与 `E:/YZST_lua_decrypted` 明文 `.lua` 行号 1:1 对应。
+- 磁盘上的 `.luac`（E:\YZST 等）是加密容器；对照明文见解密树，不要当文本打开。
 
 ## 环境注意事项（本机）
 

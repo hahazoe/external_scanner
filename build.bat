@@ -29,7 +29,7 @@ echo === Step 2: injected profiler DLL ===
 gcc %CFLAGS% -I"%LUA_INC%" -I"%SRC%common" -I"%SRC%injection" -shared ^
   -o "%GEN%\inject_exec.dll" ^
   "%SRC%injection\injected_runtime.c" "%SRC%injection\telemetry_writer.c" ^
-  "%SRC%injection\luac_dump.c" "%SRC%injection\lua_profiler.c" ^
+  "%SRC%injection\lua_profiler.c" ^
   "%SRC%injection\lua_api_hooks.c" ^
   -lpsapi -static-libgcc
 if errorlevel 1 (echo [X] FAILED && exit /b 1)

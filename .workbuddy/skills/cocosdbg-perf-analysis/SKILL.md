@@ -1,6 +1,6 @@
 ---
 name: cocosdbg-perf-analysis
-description: 分析 Cocos2d DebugView 录制的 .cocosdbg 性能日志，并结合运行时 luac dump 的明文源码，定位 Cocos2d-x + Lua 5.1 游戏进程（如 sealapp）中 Lua 耗时严重的逻辑问题。当用户提供 cocosdbg_capture_*.cocosdbg 录制文件，或要求"查性能问题 / 分析卡顿 / 找 Lua 热点 / 分析性能日志"时使用本技能。
+description: 分析 Cocos2d DebugView 录制的 .cocosdbg 性能日志，并用 E:/YZST_lua_decrypted 的解密明文定位 sealapp / 原始征途里的 Lua 热点。当用户提供 cocosdbg_capture_*.cocosdbg，或要求查性能、分析卡顿、找 Lua 热点、解密 E:/YZST 的 luac 时使用。
 agent_created: true
 ---
 
@@ -9,16 +9,15 @@ agent_created: true
 ## 概述
 
 对 DebugView 录制的 `.cocosdbg` 逐帧性能数据做离线聚合，交叉验证调用规律，
-再对照 luac dump 的明文 Lua 源码定位逻辑反模式，产出带证据（数据 + 代码行号）
+再对照 `E:/YZST_lua_decrypted` 的明文 Lua 源码定位逻辑反模式，产出带证据（数据 + 代码行号）
 和修复优先级的分析报告。
 
 ## 前置检查
 
 1. 确认录制文件路径（通常在 `build/cocosdbg_capture_YYYYMMDD_HHMMSS.cocosdbg`）。
-2. 确认明文源码 dump 位置（磁盘上的 `.luac` 是加密容器，不可解密，只能用运行时 dump）：
-   - `build/luac_dump/sealapp/` —— 完整 dump（含启动期加载的 app/scene 等核心文件）
-   - `build/generated/luac_dump/sealapp/` —— 晚期会话 dump（缺核心文件）
-   - 不确定时查两处的 `luac_dump_map.tsv`（chunk 名 → 明文路径）。
+2. 源码先读 `E:/YZST_lua_decrypted/`（`src/` 逻辑，`res/` UI）：
+   - `E:/YZST` 里的 `.luac` 是加密容器。更新明文：`python E:/YZST_lua_decrypted/decrypt_yszt_lua.py E:/YZST E:/YZST_lua_decrypted`。先解 `src`/`res`，再用 `config/Patch` 覆盖同路径。不要加 `--clean`，除非用户要求重建。签名和密钥只留在该脚本里，不要写进报告。
+   - chunk `app/data/Foo.luac` → `E:/YZST_lua_decrypted/src/app/data/Foo.lua`；`E:/YZST/config/Patch/src/main.luac` → `E:/YZST_lua_decrypted/src/main.lua`。行号就是这份 `.lua` 的源码行。相对路径先试 `src/`，没有再试 `res/`。
 3. 运行环境（本机约束）：
    - Bash 不可用；PowerShell stdout 不回传 → 脚本输出一律 `*> out.txt` 重定向，
      `Out-File` 结果是 UTF-16，用 Read 读之前先
@@ -156,7 +155,7 @@ python scripts/trace_analysis.py <capture.cocosdbg> [report.txt] [topN]
 
 ### 第 5 步：对照源码定位逻辑问题
 
-用第 2 步拿到的 `文件:行号` 到 dump 目录读代码，重点核查这些反模式：
+用第 2 步拿到的 `文件:行号` 读 `E:/YZST_lua_decrypted` 里的 `.lua`（映射见前置检查）。dump 没有该文件时不要停。重点核查这些反模式：
 
 | 反模式 | 信号 |
 |---|---|

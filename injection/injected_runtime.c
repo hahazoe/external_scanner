@@ -16,7 +16,6 @@
 #include "lualib.h"
 #include "lstate.h"
 #include "telemetry_writer.h"
-#include "luac_dump.h"
 #include "lua_profiler.h"
 #include "lua_api_hooks.h"
 #include "x86_insn.h"
@@ -94,7 +93,7 @@ static uint32_t g_drawscene_addr = 0;
 static uint32_t g_cocos_module_base = 0;
 static uint32_t g_cocos_module_size = 0;
 
-#define CPP_HOOK_MAX 12
+#define CPP_HOOK_MAX 24
 #define CPP_HOOK_SITES 64
 #define CPP_HOOK_STACK 64
 #define CPP_PATCH_LEN 5
@@ -152,6 +151,7 @@ static void profiler_on_drawscene_end(void);
 static void remote_lua_tick_timeout(void);
 static int l_drain_remote_lua(lua_State *L);
 static double query_lua_mem_kb(void);
+static void query_process_mem_kb(float *ws_kb, float *private_kb);
 static void sync_cpp_hooks_to_config(void);
 static void ensure_renderer_cpp_hook(void);
 static int add_cpp_hook_target(const char *name, uint32_t addr);
@@ -489,6 +489,78 @@ static int install_drawscene_hook(void) {
     return install_cpp_hooks() > 0;
 }
 
+/*
+ * PlistFile::releaseIfUnused() — force "return true" (skip unload).
+ * Signature is a unique interior sequence at +0x2D from the MSVC prologue
+ * (verified on sealapp 1.626 and the current local build).
+ */
+#define PLIST_RELEASE_SIG_OFF 0x2Du
+static const uint8_t k_plist_release_sig[] = {
+    0x80, 0x7B, 0x22, 0x00, 0x74, 0x14, 0x32, 0xC0,
+    0x8B, 0x4D, 0xF4, 0x64, 0x89, 0x0D, 0x00, 0x00,
+    0x00, 0x00, 0x59, 0x5F
+};
+
+static uint8_t *find_bytes(uint8_t *base, size_t size,
+                           const uint8_t *needle, size_t nlen) {
+    size_t i;
+    if (!base || !needle || nlen == 0 || size < nlen) return NULL;
+    for (i = 0; i + nlen <= size; i++) {
+        if (memcmp(base + i, needle, nlen) == 0)
+            return base + i;
+    }
+    return NULL;
+}
+
+static int patch_force_return_true(uint8_t *fn) {
+    static const uint8_t k_stub[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+    DWORD old_protect;
+    if (!fn || (uintptr_t)fn < 0x10000u) return 0;
+    if (!VirtualProtect(fn, sizeof(k_stub), PAGE_EXECUTE_READWRITE, &old_protect))
+        return 0;
+    patch_freeze_begin();
+    memcpy(fn, k_stub, sizeof(k_stub));
+    patch_freeze_end();
+    VirtualProtect(fn, sizeof(k_stub), old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), fn, sizeof(k_stub));
+    return 1;
+}
+
+/* Best-effort: missing target must not fail the whole injection. */
+static int install_plistfile_release_stub(void) {
+    HMODULE mods[1024];
+    DWORD cb = 0;
+    int n, i;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &cb))
+        return 0;
+    n = (int)(cb / sizeof(HMODULE));
+    for (i = 0; i < n; i++) {
+        MODULEINFO mi;
+        uint8_t *hit;
+        uint8_t *fn;
+        if (!GetModuleInformation(GetCurrentProcess(), mods[i], &mi, sizeof(mi)))
+            continue;
+        if (!mi.lpBaseOfDll || mi.SizeOfImage < 0x1000)
+            continue;
+        hit = find_bytes((uint8_t *)mi.lpBaseOfDll, mi.SizeOfImage,
+                         k_plist_release_sig, sizeof(k_plist_release_sig));
+        if (!hit) continue;
+        if ((uintptr_t)(hit - (uint8_t *)mi.lpBaseOfDll) < PLIST_RELEASE_SIG_OFF)
+            continue;
+        fn = hit - PLIST_RELEASE_SIG_OFF;
+        if (fn[0] != 0x55 || fn[1] != 0x8B || fn[2] != 0xEC)
+            continue;
+        if (patch_force_return_true(fn)) {
+            OutputDebugStringA(
+                "cocosdbg: PlistFile::releaseIfUnused patched to return true\n");
+            return 1;
+        }
+    }
+    OutputDebugStringA(
+        "cocosdbg: PlistFile::releaseIfUnused not found; left unchanged\n");
+    return 0;
+}
+
 static void set_detail_capture_frames(int frames) {
     int was_active = g_detail_active;
     if (frames > g_detail_frames_remaining)
@@ -525,6 +597,7 @@ static void publish_precise_frame(const CocosDebugLuaProfilerFrame *frame) {
     out->lua_c_self_ms = (float)frame->lua_c_self_ms;
     out->lua_outside_ms = (float)frame->lua_outside_ms;
     out->lua_mem_kb = (float)query_lua_mem_kb();
+    query_process_mem_kb(&out->proc_ws_kb, &out->proc_private_kb);
     out->hook_events = frame->hook_events;
     out->flags = frame->flags;
     event_dropped = InterlockedCompareExchange(
@@ -540,6 +613,10 @@ static void publish_precise_frame(const CocosDebugLuaProfilerFrame *frame) {
         ? COCOS_DEBUG_IPC_LINE_CAP : frame->line_count;
     memcpy(out->lines, frame->lines,
            out->line_count * sizeof(out->lines[0]));
+    /* Legacy v7 recording fields; sampling removed. Keep zeros for ABI. */
+    out->actor_x = 0.0f;
+    out->actor_y = 0.0f;
+    out->actor_valid = 0;
     out->cpp_count = (uint32_t)g_cpp_hook_count;
     if (out->cpp_count > COCOS_DEBUG_IPC_CPP_CAP)
         out->cpp_count = COCOS_DEBUG_IPC_CPP_CAP;
@@ -579,26 +656,86 @@ static void update_precise_detail_capture_after_frame(
 static int g_lua_mem_sample_counter;
 static double g_lua_mem_cached_kb;
 
+static FARPROC resolve_proc(const char *name);
+static void luajit_disable_engine_for_hooks(lua_State *L);
+
 static double query_lua_mem_kb(void) {
     if (!g_L || !g_GC) return 0.0;
-    if (g_lua_mem_sample_counter++ < 8 && g_lua_mem_cached_kb > 0.0)
-        return g_lua_mem_cached_kb;
+    /* Sample every published frame. LUA_GCCOUNT is cheap; the old 8-frame
+       cache made the MB axis Autofit into a staircase. */
     g_lua_mem_sample_counter = 0;
     g_lua_mem_cached_kb = (double)g_GC(g_L, LUA_GCCOUNT, 0) +
                           (double)g_GC(g_L, LUA_GCCOUNTB, 0) / 1024.0;
     return g_lua_mem_cached_kb;
 }
 
+/* 32-bit VM_COUNTERS_EX2. PrivateWorkingSetSize is the number Task
+   Manager shows in the process list Memory column. */
+typedef struct CocosDebugVmCounters {
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG PageFaultCount;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    SIZE_T QuotaPeakPagedPoolUsage;
+    SIZE_T QuotaPagedPoolUsage;
+    SIZE_T QuotaPeakNonPagedPoolUsage;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivateUsage;
+    SIZE_T PrivateWorkingSetSize;
+    ULONGLONG SharedCommitUsage;
+} CocosDebugVmCounters;
+
+typedef LONG (WINAPI *NtQueryInformationProcessFn)(HANDLE, int, void *, ULONG, ULONG *);
+
+static void query_process_mem_kb(float *ws_kb, float *private_kb) {
+    CocosDebugVmCounters info;
+    NtQueryInformationProcessFn query;
+    ULONG returned = 0;
+    if (ws_kb) *ws_kb = 0.0f;
+    if (private_kb) *private_kb = 0.0f;
+    query = (NtQueryInformationProcessFn)GetProcAddress(
+        GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+    if (!query) return;
+    memset(&info, 0, sizeof(info));
+    /* ProcessVmCounters = 3. A 64-byte buffer returns EX2, including the
+       private working set Task Manager displays. */
+    if (query(GetCurrentProcess(), 3, &info, sizeof(info), &returned) < 0)
+        return;
+    if (private_kb && returned >= offsetof(CocosDebugVmCounters, PrivateUsage) + sizeof(SIZE_T))
+        *private_kb = (float)((double)info.PrivateUsage / 1024.0);
+    if (ws_kb &&
+        returned >= offsetof(CocosDebugVmCounters, PrivateWorkingSetSize) + sizeof(SIZE_T))
+        *ws_kb = (float)((double)info.PrivateWorkingSetSize / 1024.0);
+}
+
 static void discover_precise_lua_threads(lua_State *root) {
     global_State *global;
     GCObject *object;
     if (!root) return;
+    /* LuaJIT's global_State / GC layout is not the PUC-Rio 5.1 shape that
+       lstate.h describes. Walking rootgc here would crash; new threads are
+       still registered via the lua_newthread hook. */
+    if (resolve_proc("luaJIT_setmode")) return;
     global = G(root);
     if (!global) return;
     for (object = global->rootgc; object != NULL; object = object->gch.next) {
         if (object->gch.tt == LUA_TTHREAD)
             cocos_debug_lua_profiler_register_thread(gco2th(object));
     }
+}
+
+static void luajit_disable_engine_for_hooks(lua_State *L) {
+    typedef int (__cdecl *luaJIT_setmode_fn)(lua_State *, int, int);
+    luaJIT_setmode_fn setmode;
+    if (!L) return;
+    setmode = (luaJIT_setmode_fn)resolve_proc("luaJIT_setmode");
+    if (!setmode) return;
+    /* LUAJIT_MODE_ENGINE=0, LUAJIT_MODE_OFF=0: force interpreter so
+       lua_sethook CALL/RET/COUNT actually fire on hot paths. */
+    setmode(L, 0, 0);
 }
 
 static int profiler_start_recording(void) {
@@ -618,6 +755,7 @@ static int profiler_start_recording(void) {
     g_detail_active = 0;
     g_lua_mem_sample_counter = 8;
     g_lua_mem_cached_kb = 0.0;
+    luajit_disable_engine_for_hooks(g_L);
     cocos_debug_lua_profiler_start();
     cocos_debug_lua_profiler_set_line_capture(0);
     cocos_debug_lua_profiler_register_thread(g_L);
@@ -749,14 +887,10 @@ static int l_drain_remote_lua(lua_State *L) {
     cocos_debug_lua_profiler_pause_accounting();
     if (g_GT) top = g_GT(L);
 
-    /* Prefer loadstring: not patched by luac_dump. */
     err = g_LS ? g_LS(L, g_remote_code) : -1;
     if (err != 0) {
         if (g_ST) g_ST(L, top); /* drop loadstring error before fallback */
-        err = cocos_debug_luac_dump_loadbuffer_orig(L, g_remote_code, size,
-                                             "=@COCOS_DEBUG_runLuaString");
-        if (err < 0)
-            err = g_LB ? g_LB(L, g_remote_code, size, "=@COCOS_DEBUG_runLuaString") : -1;
+        err = g_LB ? g_LB(L, g_remote_code, size, "=@COCOS_DEBUG_runLuaString") : -1;
     }
     if (err) {
         s = (err > 0 && g_TL) ? g_TL(L, -1, NULL) : NULL;
@@ -943,14 +1077,41 @@ static uint32_t find_local_export_contains(HMODULE mod, const char *needle,
 }
 
 static uint32_t resolve_local_renderer_render(void) {
-    HMODULE cocos = GetModuleHandleA("libcocos2d.dll");
-    FARPROC proc;
-    if (!cocos) return 0;
-    proc = GetProcAddress(cocos, "?render@Renderer@cocos2d@@QAEXXZ");
-    if (proc) return (uint32_t)(uintptr_t)proc;
-    proc = GetProcAddress(cocos, "?render@Renderer@cocos2d@@QAEXH@Z");
-    if (proc) return (uint32_t)(uintptr_t)proc;
-    return find_local_export_contains(cocos, "?render@Renderer@cocos2d@@", "QAEXXZ");
+    HMODULE mods[64];
+    DWORD needed = 0;
+    unsigned i, n;
+    static const char *kNames[] = {
+        "libcocos2d.dll", "cocos2d.dll", "libcocos2dx.dll", NULL
+    };
+    for (i = 0; kNames[i]; i++) {
+        HMODULE cocos = GetModuleHandleA(kNames[i]);
+        FARPROC proc;
+        uint32_t found;
+        if (!cocos) continue;
+        proc = GetProcAddress(cocos, "?render@Renderer@cocos2d@@QAEXXZ");
+        if (proc) return (uint32_t)(uintptr_t)proc;
+        proc = GetProcAddress(cocos, "?render@Renderer@cocos2d@@QAEXH@Z");
+        if (proc) return (uint32_t)(uintptr_t)proc;
+        found = find_local_export_contains(cocos, "?render@Renderer@cocos2d@@", "QAEXXZ");
+        if (found) return found;
+    }
+    /* Static-link / renamed DLL: scan every loaded module's export table. */
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+        return 0;
+    n = needed / (DWORD)sizeof(HMODULE);
+    if (n > 64) n = 64;
+    for (i = 0; i < n; i++) {
+        FARPROC proc = GetProcAddress(mods[i], "?render@Renderer@cocos2d@@QAEXXZ");
+        uint32_t found;
+        if (proc) return (uint32_t)(uintptr_t)proc;
+        proc = GetProcAddress(mods[i], "?render@Renderer@cocos2d@@QAEXH@Z");
+        if (proc) return (uint32_t)(uintptr_t)proc;
+        found = find_local_export_contains(mods[i], "?render@Renderer@cocos2d@@", "QAEXXZ");
+        if (found) return found;
+        found = find_local_export_contains(mods[i], "?render@Renderer@cocos2d@@", NULL);
+        if (found) return found;
+    }
+    return 0;
 }
 
 static int read_u32_safe(uint32_t addr, uint32_t *out) {
@@ -1175,9 +1336,9 @@ static void register_profiler_api(lua_State *L) {
     if (g_profiler_c_api) {
         register_global_cfunction(L, "_LUA_TOOL_profiler_hook_thread", l_profiler_hook_thread);
     }
-    /* Drain only needs pushcclosure; register even if hook APIs are incomplete. */
-    if (g_PCC && (g_SG || g_SFL))
+    if (g_PCC && (g_SG || g_SFL)) {
         register_global_cfunction(L, "_LUA_TOOL_drain_remote_lua", l_drain_remote_lua);
+    }
 }
 
 static void pop_one(lua_State *L) {
@@ -1207,6 +1368,7 @@ static void run_lua_on_window_thread(void) {
             if (!install_drawscene_hook()) {
                 cocos_debug_telemetry_set_state(COCOS_DEBUG_IPC_STATE_ERROR, "C++ frame hook install failed");
             } else {
+                install_plistfile_release_stub();
                 cocos_debug_telemetry_set_state(COCOS_DEBUG_IPC_STATE_READY, NULL);
             }
         } else {
@@ -1308,7 +1470,8 @@ static DWORD WINAPI thread(LPVOID u) {
     api_hook_flags = cocos_debug_lua_api_hooks_install(
         (void *)resolve_proc("lua_resume"),
         (void *)resolve_proc("lua_newthread"),
-        (void *)g_PC);
+        (void *)g_PC,
+        (void *)resolve_proc("lua_call"));
     if ((api_hook_flags & 1) == 0) {
         cocos_debug_telemetry_set_state(
             COCOS_DEBUG_IPC_STATE_ERROR, "lua_resume hook install failed");
@@ -1323,8 +1486,15 @@ static DWORD WINAPI thread(LPVOID u) {
             COCOS_DEBUG_IPC_STATE_ERROR, "lua_pcall hook install failed");
         return 1;
     }
-    cocos_debug_luac_dump_init(config->luac_dump_dir);
-    cocos_debug_luac_dump_install_hooks();
+    if ((api_hook_flags & 8) != 0) {
+        CocosDebugIpcBlock *block = cocos_debug_telemetry_block();
+        if (block)
+            block->header.features |= COCOS_DEBUG_IPC_FEATURE_LUA_CALL_HOOK;
+    } else {
+        OutputDebugStringA(
+            "cocosdbg: lua_call hook not installed; empty-stack VM time "
+            "on unprotected C->Lua entries may be undercounted\n");
+    }
     g_L = (lua_State *)(uintptr_t)config->lua_state;
     memcpy(g_code, config->bootstrap_lua, config->bootstrap_size);
     g_code[config->bootstrap_size] = 0;

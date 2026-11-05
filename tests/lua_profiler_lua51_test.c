@@ -31,6 +31,12 @@ static void capture_event(const CocosDebugIpcLuaEvent *event) {
         g_event_counts[event->type]++;
 }
 
+static int call_lua_inner(lua_State *L) {
+    lua_getglobal(L, "inner");
+    lua_call(L, 0, 0);
+    return 0;
+}
+
 static int busy_c(lua_State *L) {
     volatile int i;
     (void)L;
@@ -53,7 +59,7 @@ static void validate_frame(const char *name,
     if (frame->lua_wall_ms < 0.0 ||
         frame->lua_wall_ms > frame->body_ms + 0.2)
         fail("Lua wall is outside drawScene body");
-    if (fabs(split - frame->lua_cpu_ms) > 0.2) {
+    if (fabs(split - frame->lua_cpu_ms) > 0.05) {
         fprintf(stderr,
                 "[FAIL] %s self split %.3f != CPU %.3f\n",
                 name, split, frame->lua_cpu_ms);
@@ -67,12 +73,32 @@ static void validate_frame(const char *name,
     }
     if (frame->flags & COCOS_DEBUG_IPC_FRAME_STACK_DESYNC)
         fail("Lua stack desynchronized");
-    for (i = 0; i < frame->method_count; i++) {
-        if (frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_C)
-            saw_c = 1;
-        if (frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_LUA ||
-            frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_MAIN)
-            saw_lua = 1;
+    {
+        double script_sum = 0.0;
+        double c_sum = 0.0;
+        for (i = 0; i < frame->method_count; i++) {
+            if (frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_C) {
+                saw_c = 1;
+                c_sum += frame->methods[i].self_ms;
+            } else {
+                if (frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_LUA ||
+                    frame->methods[i].kind == COCOS_DEBUG_IPC_LUA_METHOD_MAIN)
+                    saw_lua = 1;
+                script_sum += frame->methods[i].self_ms;
+            }
+        }
+        if (fabs(script_sum - frame->lua_script_self_ms) > 0.05) {
+            fprintf(stderr,
+                    "[FAIL] %s lua method self %.3f != script %.3f\n",
+                    name, script_sum, frame->lua_script_self_ms);
+            g_failures++;
+        }
+        if (fabs(c_sum - frame->lua_c_self_ms) > 0.05) {
+            fprintf(stderr,
+                    "[FAIL] %s C method self %.3f != c %.3f\n",
+                    name, c_sum, frame->lua_c_self_ms);
+            g_failures++;
+        }
     }
     if (!saw_lua) fail("Lua method samples missing");
     if (strcmp(name, "mixed") == 0 && !saw_c)
@@ -116,10 +142,16 @@ int main(void) {
         lua_close(L);
         return 1;
     }
-    if ((cocos_debug_lua_api_hooks_install(
-             (void *)lua_resume, (void *)lua_newthread,
-             (void *)lua_pcall) & 1) == 0) {
-        fail("lua_resume API hook install failed");
+    {
+        int hooks = cocos_debug_lua_api_hooks_install(
+            (void *)lua_resume, (void *)lua_newthread,
+            (void *)lua_pcall, (void *)lua_call);
+        if ((hooks & 1) == 0)
+            fail("lua_resume API hook install failed");
+        if ((hooks & 4) == 0)
+            fail("lua_pcall API hook install failed");
+        if ((hooks & 8) == 0)
+            fail("lua_call API hook install failed");
     }
     cocos_debug_lua_profiler_start();
     cocos_debug_lua_profiler_set_trace(1);
@@ -131,12 +163,22 @@ int main(void) {
         "function tail(n) if n==0 then return 1 end "
         "return tail(n-1) end");
 
+    lua_pushcfunction(L, call_lua_inner);
+    lua_setglobal(L, "call_from_c");
+
     cocos_debug_lua_profiler_frame_begin(1);
     lua_getglobal(L, "outer");
     status = lua_pcall(L, 0, 0, 0);
     cocos_debug_lua_profiler_frame_end(&frame);
     if (status != 0) fail("mixed pcall failed");
     validate_frame("mixed", &frame);
+
+    cocos_debug_lua_profiler_frame_begin(8);
+    lua_getglobal(L, "call_from_c");
+    status = lua_pcall(L, 0, 0, 0);
+    cocos_debug_lua_profiler_frame_end(&frame);
+    if (status != 0) fail("lua-call pcall failed");
+    validate_frame("lua-call", &frame);
 
     cocos_debug_lua_profiler_frame_begin(2);
     lua_getglobal(L, "tail");

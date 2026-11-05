@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Shared streaming reader for .cocosdbg recordings (format versions 5 and 6).
+"""Shared streaming reader for .cocosdbg recordings (format versions 5 through 8).
 
 Format source of truth: debugview/recording_io.cpp (kMagic CCDBREC1).
 All integers little-endian. See references/format.md for the full spec.
@@ -11,6 +11,12 @@ v6 adds two fields over v5 (both default to 0 when reading a v5 file):
                          C calls made from it.  Prefer this over "samples":
                          samples counts VM instruction batches (1 per 4000
                          instructions) and is blind to C-call time.
+v7 adds, after flags and before the section counts (0 on older files):
+  - frame["actor_x"], frame["actor_y"], frame["actor_valid"]
+                         Legacy actor-position fields; new captures are always 0.
+v8 adds, after actor_valid and before the section counts (0 on older files):
+  - frame["proc_ws_kb"]       Private working set, KB. Same number as Task Manager's Memory column.
+  - frame["proc_private_kb"]  Process private commit, KB.
 
 Usage:
     from cocosdbg_reader import iter_frames, MAGIC, VERSION
@@ -20,7 +26,7 @@ Usage:
 import struct
 
 MAGIC = b"CCDBREC1"
-VERSION = 6
+VERSION = 8
 MIN_SUPPORTED_VERSION = 5
 
 EVENT_CALL = 1
@@ -86,7 +92,8 @@ def iter_frames(path):
 
     { publish_sequence, begin_s, end_s, lua_frame_index, render_frame_sequence,
       period_ms, drawscene_ms, wall_ms, cpu_ms, script_ms, c_ms,
-      outside_ms, mem_kb, hook_events, flags,
+      outside_ms, mem_kb, hook_events, flags, actor_x, actor_y, actor_valid,
+      proc_ws_kb, proc_private_kb,
       lua_methods: [ {name, kind, flags, self_ms, incl_ms, max_self_ms,
                       max_incl_ms, started, completed, active} ],
       cpp_methods: [ {name, total_ms, max_ms, last_ms, calls, call_sequence} ],
@@ -107,6 +114,16 @@ def iter_frames(path):
                 (pub, begin_s, end_s, lfi, rfs, period, drawscene, wall, cpu,
                  script, cself, mem_kb, hook_events, flags) = values
                 outside_ms = 0.0
+            actor_x = 0.0
+            actor_y = 0.0
+            actor_valid = 0
+            if version >= 7:
+                actor_x, actor_y = struct.unpack("<ff", f.read(8))
+                actor_valid = _u32(f)
+            proc_ws_kb = 0.0
+            proc_private_kb = 0.0
+            if version >= 8:
+                proc_ws_kb, proc_private_kb = struct.unpack("<ff", f.read(8))
             frame = {
                 "publish_sequence": pub,
                 "begin_s": begin_s,
@@ -123,6 +140,11 @@ def iter_frames(path):
                 "mem_kb": mem_kb,
                 "hook_events": hook_events,
                 "flags": flags,
+                "actor_x": actor_x,
+                "actor_y": actor_y,
+                "actor_valid": actor_valid,
+                "proc_ws_kb": proc_ws_kb,
+                "proc_private_kb": proc_private_kb,
                 "lua_methods": [],
                 "cpp_methods": [],
                 "lua_lines": [],

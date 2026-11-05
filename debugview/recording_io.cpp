@@ -12,8 +12,12 @@
 static const char kMagic[8] = {'C', 'C', 'D', 'B', 'R', 'E', 'C', '1'};
 /* 5: first shipped layout.
    6: adds FrameSnapshot.lua_outside_ms and LuaLineSnapshot.line_ms (v6 files
-      are read by v6 readers; v5 files still load, with both fields 0). */
-static const uint32_t kVersion = 6;
+      are read by v6 readers; v5 files still load, with both fields 0).
+   7: adds actor_x/actor_y/actor_valid after flags (legacy; always 0 now).
+      Older files load with actor_valid = 0.
+   8: adds proc_ws_kb/proc_private_kb after actor_valid. Older files load
+      with both fields 0. */
+static const uint32_t kVersion = 8;
 static const uint32_t kMinSupportedVersion = 5;
 
 static bool write_raw(FILE *fp, const void *data, size_t size) {
@@ -125,6 +129,11 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
     if (!write_f32(fp, frame.lua_mem_kb)) return false;
     if (!write_u32(fp, frame.hook_events)) return false;
     if (!write_u32(fp, frame.flags)) return false;
+    if (!write_f32(fp, frame.actor_x)) return false;
+    if (!write_f32(fp, frame.actor_y)) return false;
+    if (!write_u32(fp, frame.actor_valid)) return false;
+    if (!write_f32(fp, frame.proc_ws_kb)) return false;
+    if (!write_f32(fp, frame.proc_private_kb)) return false;
     if (!write_u32(fp, lua_count)) return false;
     if (!write_u32(fp, cpp_count)) return false;
     if (!write_u32(fp, line_count)) return false;
@@ -198,6 +207,20 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame, uint32_t version) {
     if (!read_f32(fp, &frame->lua_mem_kb)) return false;
     if (!read_u32(fp, &frame->hook_events)) return false;
     if (!read_u32(fp, &frame->flags)) return false;
+    frame->actor_x = 0.0f;
+    frame->actor_y = 0.0f;
+    frame->actor_valid = 0;
+    if (version >= 7) {
+        if (!read_f32(fp, &frame->actor_x)) return false;
+        if (!read_f32(fp, &frame->actor_y)) return false;
+        if (!read_u32(fp, &frame->actor_valid)) return false;
+    }
+    frame->proc_ws_kb = 0.0f;
+    frame->proc_private_kb = 0.0f;
+    if (version >= 8) {
+        if (!read_f32(fp, &frame->proc_ws_kb)) return false;
+        if (!read_f32(fp, &frame->proc_private_kb)) return false;
+    }
     if (!read_u32(fp, &lua_count)) return false;
     if (!read_u32(fp, &cpp_count)) return false;
     if (!read_u32(fp, &line_count)) return false;

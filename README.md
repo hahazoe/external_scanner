@@ -4,15 +4,14 @@
 
 DebugView 作为独立窗口运行：扫描目标进程中的 Lua VM 和 Cocos2d 导出，注入采集 DLL，再通过共享内存把逐帧数据拉回本机 UI。运行期间不在游戏场景里创建显示节点，也不把逐帧数据写到磁盘（主动保存录制除外）。
 
-适用目标大致是：带可见主窗口、加载了 `libcocos2d.dll` 和 Lua 5.1 的 32 位进程。不同游戏的 dump 与录制互不绑定。
+适用目标大致是：带可见主窗口、Cocos2d-x（`libcocos2d.dll` / 改名 DLL / 静态链进主 exe）+ **Lua 5.1 或 LuaJIT 2.x**（常伪装成 `lua51.dll`）的 32 位进程。`Director::drawScene` 可从 PE 导出或旁路 PDB 解析。不同游戏的 dump 与录制互不绑定。
 
 ## 能力概览
 
-- 实时曲线：DrawScene Body、帧间隔 DeltaTime、Renderer submit、Lua wall / CPU / self
+- 实时曲线：DrawScene Body、帧间隔 DeltaTime、Renderer submit、Lua 总耗时 / 脚本 / C、Lua 堆内存（右轴 MB）
 - 逐帧 Lua 方法表（self / inclusive / 调用次数）和可选 C++ hook 样本
 - 可选 Lua 行热点（COUNT 采样）和原始 CALL/RET 事件流
 - 远程执行 Lua（编辑器或 DebugList 片段），支持全局热键
-- 把目标进程 `loadbuffer` / `loadfile` 到的 chunk 转储到 `luac_dump/<进程名>/`
 - 保存 / 加载 `.cocosdbg` 录制（含可选窗口预览图）
 
 ## 架构
@@ -63,7 +62,6 @@ flowchart LR
 |------|------|
 | `build/debugview.exe` | 主程序 |
 | `build/debug_list/` | 本地 Lua 片段与 `index.txt` |
-| `build/luac_dump/<进程名>/` | 该进程的 Lua chunk 转储 |
 | `build/generated/` | 嵌入头文件、测试 exe、ImGui 对象缓存 |
 
 ## 构建
@@ -114,29 +112,31 @@ build\generated\runtime_ab_test.exe <pid>
 
 ### 注入与二次注入
 
-C++ 采集目标在 [`injection/injector.c`](injection/injector.c) 的 `resolve_cpp_hooks()` 里：
+C++ 采集目标在 [`injection/injector.c`](injection/injector.c) 的 `resolve_cpp_hooks()` 里（IPC CAP=24）：
 
-- 必选：`cc.Director:drawScene`（帧边界）
-- 常见 submit：`cc.Renderer:render`
-- 可选：`cc.Scene:render`（解析到才安装）
+- 必选：`cc.Director:drawScene`（帧边界）；`cc.Renderer:render`（解析失败仍占槽，供 runtime 旁路补洞）
+- 解析到才安装：`cc.Scene:render`、`cc.Scheduler:update`、`cc.EventDispatcher:dispatchEvent`、`cc.Renderer:clear`
+- 贴图：`cc.TextureCache:addImage`
+- 游戏代码（主 exe 特征扫描，无导出）：`PlistManager:addSpriteFrames`
 
-符号先在 `libcocos2d.dll` 里找，再回退到目标主可执行模块。不要 hook `Node::visit` 这类极高频方法。
+解析顺序：进程内所有模块的 PE 导出（精确 mangled 名 + 模糊匹配）→ 对 cocos 相关模块与主 exe 用 dbghelp 读旁路 PDB。不要 hook `Node::visit` 这类极高频方法。
 
 如果提示目标进程里已经有 profiler DLL，必须先**重启该进程**再注入，不要二次注入。
 
 ## 指标含义
 
-Lua 统计窗口严格限定为 `Director::drawScene` 原函数体。CALL / RET / TAILRET 按每个 `lua_State` 独立调用栈记账；`lua_resume` 的进入和返回用来扣掉协程 yield 后的等待。跨帧调用不切栈，只按当前 drawScene 窗口裁剪。
+Lua 统计窗口严格限定为 `Director::drawScene` 原函数体。CALL / RET / TAILRET 按每个 `lua_State` 独立调用栈记账；时间片互斥记入脚本或 C，**Lua 总耗时 = 脚本 + C**。`lua_resume` / `lua_pcall` / `lua_call` 的进入和返回用来扣掉协程 yield 后的等待，并把空栈上的 VM 开销记入 C。跨帧调用不切栈，只按当前 drawScene 窗口裁剪。
 
 | 名称 | 含义 |
 |------|------|
 | DrawScene / Body | 这一次 `drawScene` 函数体耗时 |
 | DeltaTime | 这次 `drawScene` 开始到下一次开始：body + present / vsync / idle。有 vsync 时会贴在 16.67/33ms；Body 变慢出现在**同一帧**的 DeltaTime 上 |
 | render | `cc.Renderer:render` 的 submit。没解析到符号显示 not installed；解析到但 0 次调用说明 export 不在提交路径上 |
-| Lua wall | 所有 Lua 线程执行区间的并集，表示它们占了多少墙钟 |
-| Lua CPU | 各 Lua 线程执行时间之和；并行时可以大于 wall |
-| Lua self | Lua / main 函数独占时间 |
-| C self | 从 Lua 调到的 C 函数独占时间 |
+| Lua 总耗时 (`lua_cpu_ms`) | 窗口内脚本 self + C self，由构造相等。并行多 `lua_State` 时是求和，可以大于 wall |
+| Lua 脚本 | 影子栈顶为 Lua / main 的独占时间 |
+| C | 从 Lua 调进去的 C 函数独占时间，加上 `lua_pcall` / `lua_call` / `lua_resume` 空栈上的 VM 开销。不含 drawScene / Renderer 等 C++ hook |
+| Lua wall | 所有 Lua 线程执行区间的并集，只作多线程重叠参考；衡量占用用总耗时 |
+| Lua outside | 上一帧 drawScene 结束到本帧窗口打开之间的 Lua，不进总耗时 |
 | inclusive | 含同一 `lua_State` 的嵌套调用 |
 | self（方法表） | 不含子调用 |
 | 行热点 | 每 4000 条 VM 指令一次 COUNT 采样，只是样本数和占比，不是精确毫秒 |
@@ -180,21 +180,11 @@ magic 或版本不一致会直接拒绝连接，不读旧协议。
 
 未注入时也可以编辑；**Run** 需要先 Inject and connect。
 
-### Lua chunk 转储
-
-注入成功后，hook `luaL_loadbuffer` / `luaL_loadfile`，把 chunk 写到：
-
-```
-<debugview.exe 目录>\luac_dump\<进程名>\
-```
-
-进程名由目标 exe 去掉扩展名并做路径安全化得到，例如 `sealapp.exe` → `luac_dump/sealapp/`。同时生成 `luac_dump_map.tsv`。profiler 自身的 bootstrap / 远程执行 chunk 会被跳过。
-
 ## 目标约束
 
 - **仅 32 位** Windows 进程（构建与注入都是 `-m32`）
-- 需要能解析 `cocos2d::Director::drawScene`（通常来自 `libcocos2d.dll`）
-- Lua 5.1：扫描 `global_State` / `lua_State`，hook `lua_sethook`、`lua_resume`、`lua_newthread`
+- 需要能解析 `cocos2d::Director::drawScene`（导出表或同目录 PDB；引擎可在 `libcocos2d.dll` / 改名 DLL / 主 exe）
+- Lua 5.1 或 LuaJIT 2.x：扫描 `global_State` / `lua_State`（LuaJIT 走 mainthref），hook `lua_sethook`、`lua_resume`、`lua_newthread`；LuaJIT 录制时会 `luaJIT_setmode(ENGINE, OFF)` 以便 hook 生效
 - 远程 Lua drain 依赖 `cc.Director:getInstance():getScheduler()`
 - 列表里只出现有可见根窗口的进程；无窗口后台进程不会显示
 
@@ -207,8 +197,8 @@ magic 或版本不一致会直接拒绝连接，不读旧协议。
 | 测试 | 覆盖 |
 |------|------|
 | `tests/ipc_selftest.c` | 共享内存映射、字典、帧 seqlock、事件、命令 |
-| `tests/lua_profiler_core_test.c` | 调用栈、self/inclusive、协程裁剪 |
-| `tests/lua_profiler_lua51_test.c` | 链入 Lua 5.1 源码的集成路径 |
+| `tests/lua_profiler_core_test.c` | 调用栈、self/inclusive；恒等式 总=脚本+C；空栈 VM；窗口外排除；单线程 wall≈cpu |
+| `tests/lua_profiler_lua51_test.c` | 真 `lua_pcall` / `lua_call` 嵌套、kind 拆分、出错展开 |
 | `tests/recording_io_test.cpp` | `.cocosdbg` 往返与旧版本拒绝 |
 
 `tests/runtime_ab_test.c` 不进默认构建，需要 `build.bat ab` 且目标进程已在运行。

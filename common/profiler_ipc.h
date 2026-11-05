@@ -9,10 +9,10 @@ extern "C" {
 #endif
 
 #define COCOS_DEBUG_IPC_MAGIC 0x42444343u /* CCDB */
-#define COCOS_DEBUG_IPC_VERSION 9u
+#define COCOS_DEBUG_IPC_VERSION 12u
 #define COCOS_DEBUG_IPC_MAPPING_FMT "Local\\CocosDebugProfiler_v%u_%lu"
 
-#define COCOS_DEBUG_IPC_CPP_CAP 12
+#define COCOS_DEBUG_IPC_CPP_CAP 24
 #define COCOS_DEBUG_IPC_CPP_NAME 80
 #define COCOS_DEBUG_IPC_METHOD_CAP 2048
 #define COCOS_DEBUG_IPC_METHOD_DICT_CAP 4096
@@ -69,7 +69,10 @@ enum CocosDebugIpcFeatures {
     COCOS_DEBUG_IPC_FEATURE_LINE_QPC_TIME = 1u << 5,
     /* CocosDebugIpcFrame carries lua_outside_ms: Lua time spent outside the
        drawScene window (previously thrown away entirely). */
-    COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW = 1u << 6
+    COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW = 1u << 6,
+    /* lua_call trampoline installed: empty-stack VM slices inside unprotected
+       C→Lua entries are classified as C. */
+    COCOS_DEBUG_IPC_FEATURE_LUA_CALL_HOOK = 1u << 7
 };
 
 enum CocosDebugIpcLuaMethodKind {
@@ -111,8 +114,6 @@ typedef struct CocosDebugIpcInjectionConfig {
     CocosDebugIpcCppTarget cpp_targets[COCOS_DEBUG_IPC_CPP_CAP];
     uint32_t bootstrap_size;
     char bootstrap_lua[COCOS_DEBUG_IPC_BOOTSTRAP_CAP];
-    /* Absolute dir for per-chunk luac dumps (e.g. ...\build\luac_dump\<process>). */
-    char luac_dump_dir[COCOS_DEBUG_IPC_PATH_CAP];
 } CocosDebugIpcInjectionConfig;
 
 typedef struct CocosDebugIpcMethodDictionaryEntry {
@@ -182,6 +183,7 @@ typedef struct CocosDebugIpcFrame {
     float frame_period_ms;
     float drawscene_body_ms;
     float lua_wall_ms;
+    /* Lua total inside the drawScene window: script + C, by construction. */
     float lua_cpu_ms;
     float lua_script_self_ms;
     float lua_c_self_ms;
@@ -190,6 +192,10 @@ typedef struct CocosDebugIpcFrame {
        attributed to any method -- it is the Lua the old window discarded. */
     float lua_outside_ms;
     float lua_mem_kb;
+    /* Task Manager process-list memory: private working set, in KB.
+       proc_private_kb is the private commit. 0 if the sample failed. */
+    float proc_ws_kb;
+    float proc_private_kb;
     uint32_t hook_events;
     uint32_t flags;
     uint32_t method_count;
@@ -199,6 +205,10 @@ typedef struct CocosDebugIpcFrame {
     CocosDebugIpcCppSample cpp[COCOS_DEBUG_IPC_CPP_CAP];
     CocosDebugIpcMethodSample methods[COCOS_DEBUG_IPC_METHOD_CAP];
     CocosDebugIpcLineSample lines[COCOS_DEBUG_IPC_LINE_CAP];
+    /* Legacy v7 recording fields (always 0). Kept for shared-memory ABI. */
+    float actor_x;
+    float actor_y;
+    uint32_t actor_valid;
 } CocosDebugIpcFrame;
 
 typedef struct CocosDebugIpcHeader {

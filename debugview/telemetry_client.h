@@ -43,6 +43,17 @@ struct CppMethodSnapshot {
           call_sequence(0) {}
 };
 
+struct FileIoSnapshot {
+    const std::string *path;
+    float total_ms;
+    float max_ms;
+    float last_ms;
+    uint32_t calls;
+
+    FileIoSnapshot()
+        : path(0), total_ms(0), max_ms(0), last_ms(0), calls(0) {}
+};
+
 struct LuaLineSnapshot {
     const std::string *source;
     const std::string *function_name;
@@ -108,6 +119,7 @@ struct FrameSnapshot {
     uint32_t actor_valid;
     std::vector<LuaMethodSnapshot> lua_methods;
     std::vector<CppMethodSnapshot> cpp_methods;
+    std::vector<FileIoSnapshot> file_io;
     std::vector<LuaLineSnapshot> lua_lines;
     std::vector<LuaTraceEventSnapshot> trace_events;
 

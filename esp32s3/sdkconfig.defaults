@@ -1,5 +1,8 @@
 # Keep UART console on USB-UART bridge (COM4) for logs.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 
-# TinyUSB HID mouse (native USB-OTG port)
-CONFIG_TINYUSB_HID_COUNT=1
+# Audio task runs at 1 ms cadence; needs 1 kHz FreeRTOS tick.
+CONFIG_FREERTOS_HZ=1000
+
+# Keep SoftAP current peaks modest when the board is powered from USB-UART.
+CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=10

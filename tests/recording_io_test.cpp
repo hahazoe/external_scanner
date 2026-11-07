@@ -87,6 +87,16 @@ static void test_round_trip(const char *path) {
     cpp.call_sequence = 77;
     frame.cpp_methods.push_back(cpp);
 
+    {
+        FileIoSnapshot file_io;
+        file_io.path = cocos_debug_pool_intern("res/ui/main.png");
+        file_io.total_ms = 1.5f;
+        file_io.max_ms = 1.2f;
+        file_io.last_ms = 0.3f;
+        file_io.calls = 2;
+        frame.file_io.push_back(file_io);
+    }
+
     line.source = cocos_debug_pool_intern("foo.lua");
     line.function_name = method.name;
     line.line = 12;
@@ -125,6 +135,12 @@ static void test_round_trip(const char *path) {
         CHECK(loaded.cpp_methods.size() == 1 &&
               loaded.cpp_methods[0].call_sequence == cpp.call_sequence,
               "C++ call sequence");
+        CHECK(loaded.file_io.size() == 1 &&
+              loaded.file_io[0].calls == 2 &&
+              loaded.file_io[0].total_ms == 1.5f &&
+              cocos_debug_snapshot_text(loaded.file_io[0].path) ==
+                  "res/ui/main.png",
+              "getData file_io");
         CHECK(loaded.lua_lines.size() == 1 &&
               loaded.lua_lines[0].samples == line.samples,
               "line samples");

@@ -26,7 +26,7 @@ flowchart LR
     UI --> Injector
   end
   subgraph ipc [Named shared memory]
-    Map["Local\\CocosDebugProfiler_v8_pid"]
+    Map["Local\\CocosDebugProfiler_v13_pid"]
   end
   subgraph target [Target process]
     DLL[inject_exec.dll]
@@ -40,7 +40,7 @@ flowchart LR
   DLL <--> Map
 ```
 
-两端通过 `Local\CocosDebugProfiler_v8_<pid>` 通信。协议定义在 [`common/profiler_ipc.h`](common/profiler_ipc.h)：双向命令、心跳、方法字典、256 帧 seqlock 环、可开关的 Lua 事件环。
+两端通过 `Local\CocosDebugProfiler_v13_<pid>` 通信。协议定义在 [`common/profiler_ipc.h`](common/profiler_ipc.h)：双向命令、心跳、方法字典、256 帧 seqlock 环、可开关的 Lua 事件环、getData 按文件样本。
 
 注入后的主循环挂在目标窗口过程上，以 `Director::drawScene` 为帧边界；远程 Lua 不在 C++ hook 里直接 `pcall`，而是由 Cocos Scheduler 在安全 Lua 上下文中 drain。
 
@@ -117,6 +117,7 @@ C++ 采集目标在 [`injection/injector.c`](injection/injector.c) 的 `resolve_
 - 必选：`cc.Director:drawScene`（帧边界）；`cc.Renderer:render`（解析失败仍占槽，供 runtime 旁路补洞）
 - 解析到才安装：`cc.Scene:render`、`cc.Scheduler:update`、`cc.EventDispatcher:dispatchEvent`、`cc.Renderer:clear`
 - 贴图：`cc.TextureCache:addImage`
+- 读文件：`FileUtilsWin32:getData`（无导出。从 `FileUtilsWin32::getDataFromFile` 里唯一的 `call` 解析，并要求入口是 `push 4Ch`。空文件名和 `CreateFileW` 失败都跳到同一段 SEH 收尾的唯一 `ret`，prologue 钩子的返回地址替换能罩住）
 - 游戏代码（主 exe 特征扫描，无导出）：`PlistManager:addSpriteFrames`
 
 解析顺序：进程内所有模块的 PE 导出（精确 mangled 名 + 模糊匹配）→ 对 cocos 相关模块与主 exe 用 dbghelp 读旁路 PDB。不要 hook `Node::visit` 这类极高频方法。
@@ -149,7 +150,7 @@ Lua 统计窗口严格限定为 `Director::drawScene` 原函数体。CALL / RET 
 
 | 项 | 值 |
 |----|----|
-| 映射名 | `Local\CocosDebugProfiler_v8_<pid>` |
+| 映射名 | `Local\CocosDebugProfiler_v13_<pid>` |
 | magic | `0x42444343`（`CCDB`） |
 | 版本 | 8 |
 

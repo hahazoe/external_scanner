@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Shared streaming reader for .cocosdbg recordings (format versions 5 through 8).
+"""Shared streaming reader for .cocosdbg recordings (format versions 5 through 9).
 
 Format source of truth: debugview/recording_io.cpp (kMagic CCDBREC1).
 All integers little-endian. See references/format.md for the full spec.
@@ -17,6 +17,8 @@ v7 adds, after flags and before the section counts (0 on older files):
 v8 adds, after actor_valid and before the section counts (0 on older files):
   - frame["proc_ws_kb"]       Private working set, KB. Same number as Task Manager's Memory column.
   - frame["proc_private_kb"]  Process private commit, KB.
+v9 adds, after CppMethod entries and before line samples (empty on older files):
+  - frame["file_io"]     Per-path FileUtilsWin32:getData aggregates for the frame.
 
 Usage:
     from cocosdbg_reader import iter_frames, MAGIC, VERSION
@@ -26,7 +28,7 @@ Usage:
 import struct
 
 MAGIC = b"CCDBREC1"
-VERSION = 8
+VERSION = 9
 MIN_SUPPORTED_VERSION = 5
 
 EVENT_CALL = 1
@@ -97,6 +99,7 @@ def iter_frames(path):
       lua_methods: [ {name, kind, flags, self_ms, incl_ms, max_self_ms,
                       max_incl_ms, started, completed, active} ],
       cpp_methods: [ {name, total_ms, max_ms, last_ms, calls, call_sequence} ],
+      file_io:     [ {path, total_ms, max_ms, last_ms, calls} ],  # v9+
       lua_lines:   [ {source, function_name, line, samples, line_ms} ],
       trace_events:[ {event_sequence, qpc, time_seconds, frame_sequence,
                       lua_thread_id, os_thread_id, method_id, method_name,
@@ -147,6 +150,7 @@ def iter_frames(path):
                 "proc_private_kb": proc_private_kb,
                 "lua_methods": [],
                 "cpp_methods": [],
+                "file_io": [],
                 "lua_lines": [],
                 "trace_events": [],
             }
@@ -178,6 +182,18 @@ def iter_frames(path):
                     "calls": _u32(f),
                     "call_sequence": _u32(f),
                 })
+            if version >= 9:
+                fic = _u32(f)
+                if fic > 100000:
+                    raise CocosDbgFormatError("implausible file_io count")
+                for _ in range(fic):
+                    frame["file_io"].append({
+                        "path": _rstr(f),
+                        "total_ms": _f32(f),
+                        "max_ms": _f32(f),
+                        "last_ms": _f32(f),
+                        "calls": _u32(f),
+                    })
             for _ in range(lnc):
                 source = _rstr(f)
                 function_name = _rstr(f)

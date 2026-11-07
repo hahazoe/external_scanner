@@ -165,6 +165,7 @@ CocosDebugIpcFrame *cocos_debug_telemetry_begin_frame(uint64_t publish_sequence)
     memset((unsigned char *)frame + clear_offset, 0,
            COCOS_DEBUG_IPC_FRAME_PREFIX_SIZE - clear_offset);
     memset(frame->lines, 0, sizeof(frame->lines));
+    memset(frame->file_io, 0, sizeof(frame->file_io));
     frame->publish_sequence = publish_sequence;
     return frame;
 }

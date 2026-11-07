@@ -673,6 +673,43 @@ static uintptr_t resolve_plist_add_sprite_frames(HANDLE hp, const ModInfo *mod) 
     return hits == 1 ? found : 0;
 }
 
+/*
+ * FileUtilsWin32::getData is static and has no export. The exported
+ * getDataFromFile wrapper is a short function with one near call; that
+ * target is getData. Both early returns (empty name, CreateFileW failure)
+ * jump to the same SEH epilogue and a single ret, so the prologue hook's
+ * return-address swap covers every exit. Reject the site unless the
+ * callee starts with the SEH frame push (push 4Ch).
+ */
+static uintptr_t resolve_win32_getdata(HANDLE hp, const ModInfo *mod) {
+    uintptr_t wrapper;
+    uint8_t buf[48];
+    uint8_t pro[2];
+    int i;
+    int calls = 0;
+    uintptr_t target = 0;
+    if (!hp || !mod || !mod->found || mod->base < 0x10000) return 0;
+    wrapper = resolve_remote_export_contains(
+        hp, mod, "?getDataFromFile@FileUtilsWin32@cocos2d@@", NULL);
+    if (wrapper < 0x10000) return 0;
+    if (!rpm(hp, wrapper, buf, sizeof(buf))) return 0;
+    for (i = 0; i + 5 <= (int)sizeof(buf); i++) {
+        int32_t rel;
+        uintptr_t cand;
+        if (buf[i] == 0xC2 || buf[i] == 0xC3) break;
+        if (buf[i] != 0xE8) continue;
+        memcpy(&rel, buf + i + 1, 4);
+        cand = (wrapper + (uintptr_t)i + 5) + (intptr_t)rel;
+        if (cand < mod->base || cand >= mod->base + mod->size) continue;
+        calls++;
+        target = cand;
+    }
+    if (calls != 1) return 0;
+    if (!rpm(hp, target, pro, sizeof(pro))) return 0;
+    if (pro[0] != 0x6A || pro[1] != 0x4C) return 0;
+    return target;
+}
+
 /* Optional suspects: only occupy a slot when the export resolves. */
 static void try_add_cpp_target(HANDLE hp, DWORD pid, CocosDebugIpcInjectionConfig *config,
                                const char *name) {
@@ -729,6 +766,25 @@ static void resolve_cpp_hooks(HANDLE hp, DWORD pid, uintptr_t drawscene_addr,
 
     for (i = 0; kOptional[i]; i++)
         try_add_cpp_target(hp, pid, config, kOptional[i]);
+
+    /* Static FileUtilsWin32::getData. Per-frame time uses the existing prologue hook. */
+    if (config->cpp_count < COCOS_DEBUG_IPC_CPP_CAP) {
+        ModInfo cocos;
+        uintptr_t addr = 0;
+        memset(&cocos, 0, sizeof(cocos));
+        if (find_module(pid, "libcocos2d.dll", &cocos) ||
+            find_module(pid, "cocos2d.dll", &cocos) ||
+            find_module(pid, "libcocos2dx.dll", &cocos) ||
+            find_module(pid, "libcocos2d-x.dll", &cocos))
+            addr = resolve_win32_getdata(hp, &cocos);
+        if (addr >= 0x10000) {
+            strncpy(config->cpp_targets[config->cpp_count].name,
+                    "FileUtilsWin32:getData", COCOS_DEBUG_IPC_CPP_NAME - 1);
+            config->cpp_targets[config->cpp_count].name[COCOS_DEBUG_IPC_CPP_NAME - 1] = 0;
+            config->cpp_targets[config->cpp_count].address = (uint32_t)addr;
+            config->cpp_count++;
+        }
+    }
 
     /* Game code, not a cocos export. Scan the main exe for the Lua thunk. */
     if (config->cpp_count < COCOS_DEBUG_IPC_CPP_CAP) {
@@ -851,7 +907,8 @@ static int create_session_mapping(DWORD pid, CocosDebugInjectionSession *session
         COCOS_DEBUG_IPC_FEATURE_PRECISE_LUA |
         COCOS_DEBUG_IPC_FEATURE_LINE_SAMPLES |
         COCOS_DEBUG_IPC_FEATURE_LINE_QPC_TIME |
-        COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW;
+        COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW |
+        COCOS_DEBUG_IPC_FEATURE_GETDATA_FILES;
     ipc->header.qpc_frequency = (uint64_t)freq.QuadPart;
     ipc->header.state = COCOS_DEBUG_IPC_STATE_CREATED;
     ipc->header.viewer_heartbeat_ms = GetTickCount();

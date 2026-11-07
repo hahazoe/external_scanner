@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define COCOS_DEBUG_IPC_MAGIC 0x42444343u /* CCDB */
-#define COCOS_DEBUG_IPC_VERSION 12u
+#define COCOS_DEBUG_IPC_VERSION 13u
 #define COCOS_DEBUG_IPC_MAPPING_FMT "Local\\CocosDebugProfiler_v%u_%lu"
 
 #define COCOS_DEBUG_IPC_CPP_CAP 24
@@ -19,6 +19,7 @@ extern "C" {
 #define COCOS_DEBUG_IPC_METHOD_KEY 256
 #define COCOS_DEBUG_IPC_FRAME_CAP 256
 #define COCOS_DEBUG_IPC_LINE_CAP 128
+#define COCOS_DEBUG_IPC_FILE_IO_CAP 64
 #define COCOS_DEBUG_IPC_EVENT_CAP 32768
 #define COCOS_DEBUG_IPC_BOOTSTRAP_CAP 65536
 #define COCOS_DEBUG_IPC_REMOTE_LUA_CAP 65536
@@ -55,7 +56,8 @@ enum CocosDebugIpcFrameFlags {
     COCOS_DEBUG_IPC_FRAME_LINE_CAPTURED = 1u << 4,
     COCOS_DEBUG_IPC_FRAME_STACK_DESYNC = 1u << 5,
     COCOS_DEBUG_IPC_FRAME_STATE_CONCURRENT = 1u << 6,
-    COCOS_DEBUG_IPC_FRAME_INTERVAL_LIMITED = 1u << 7
+    COCOS_DEBUG_IPC_FRAME_INTERVAL_LIMITED = 1u << 7,
+    COCOS_DEBUG_IPC_FRAME_FILE_IO_LIMITED = 1u << 8
 };
 
 enum CocosDebugIpcFeatures {
@@ -72,7 +74,9 @@ enum CocosDebugIpcFeatures {
     COCOS_DEBUG_IPC_FEATURE_LUA_OUTSIDE_WINDOW = 1u << 6,
     /* lua_call trampoline installed: empty-stack VM slices inside unprotected
        C→Lua entries are classified as C. */
-    COCOS_DEBUG_IPC_FEATURE_LUA_CALL_HOOK = 1u << 7
+    COCOS_DEBUG_IPC_FEATURE_LUA_CALL_HOOK = 1u << 7,
+    /* CocosDebugIpcFrame carries per-path FileUtilsWin32::getData samples. */
+    COCOS_DEBUG_IPC_FEATURE_GETDATA_FILES = 1u << 8
 };
 
 enum CocosDebugIpcLuaMethodKind {
@@ -159,6 +163,15 @@ typedef struct CocosDebugIpcLineSample {
     uint64_t qpc;
 } CocosDebugIpcLineSample;
 
+/* Per-path aggregate for FileUtilsWin32::getData within one drawScene frame. */
+typedef struct CocosDebugIpcFileIoSample {
+    float total_ms;
+    float max_ms;
+    float last_ms;
+    uint32_t calls;
+    char path[COCOS_DEBUG_IPC_PATH_CAP];
+} CocosDebugIpcFileIoSample;
+
 typedef struct CocosDebugIpcLuaEvent {
     volatile int32_t sequence;
     uint32_t event_sequence;
@@ -201,10 +214,11 @@ typedef struct CocosDebugIpcFrame {
     uint32_t method_count;
     uint32_t cpp_count;
     uint32_t line_count;
-    uint32_t reserved1;
+    uint32_t file_io_count;
     CocosDebugIpcCppSample cpp[COCOS_DEBUG_IPC_CPP_CAP];
     CocosDebugIpcMethodSample methods[COCOS_DEBUG_IPC_METHOD_CAP];
     CocosDebugIpcLineSample lines[COCOS_DEBUG_IPC_LINE_CAP];
+    CocosDebugIpcFileIoSample file_io[COCOS_DEBUG_IPC_FILE_IO_CAP];
     /* Legacy v7 recording fields (always 0). Kept for shared-memory ABI. */
     float actor_x;
     float actor_y;
@@ -263,12 +277,14 @@ typedef struct CocosDebugIpcBlock {
 static_assert(sizeof(CocosDebugIpcMethodSample) == 40, "IPC method layout changed");
 static_assert(sizeof(CocosDebugIpcCppSample) == 24, "IPC C++ layout changed");
 static_assert(sizeof(CocosDebugIpcLineSample) == 24, "IPC line layout changed");
+static_assert(sizeof(CocosDebugIpcFileIoSample) == 276, "IPC file_io layout changed");
 static_assert(sizeof(CocosDebugIpcLuaEvent) == 40, "IPC event layout changed");
 static_assert(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping is too large");
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(CocosDebugIpcMethodSample) == 40, "IPC method layout changed");
 _Static_assert(sizeof(CocosDebugIpcCppSample) == 24, "IPC C++ layout changed");
 _Static_assert(sizeof(CocosDebugIpcLineSample) == 24, "IPC line layout changed");
+_Static_assert(sizeof(CocosDebugIpcFileIoSample) == 276, "IPC file_io layout changed");
 _Static_assert(sizeof(CocosDebugIpcLuaEvent) == 40, "IPC event layout changed");
 _Static_assert(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping is too large");
 #endif

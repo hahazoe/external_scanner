@@ -1,5 +1,5 @@
 ## IDF Component Manager Manifest File
+## tinyusb 已内置于工程 components/tinyusb（需 REQUIRES main 以包含 tusb_config.h），
+## 不再从组件仓库拉取。
 dependencies:
-  espressif/esp_tinyusb:
-    version: "^2.0.0"
   idf: "^5.0"

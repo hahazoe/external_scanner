@@ -21,7 +21,7 @@ int main(void) {
     int command_sequence = 0;
 
     CHECK(sizeof(CocosDebugIpcBlock) < 48u * 1024u * 1024u, "IPC mapping unexpectedly large");
-    CHECK(COCOS_DEBUG_IPC_VERSION == 12u, "unexpected IPC version");
+    CHECK(COCOS_DEBUG_IPC_VERSION == 13u, "unexpected IPC version");
     CHECK(sizeof(CocosDebugIpcMethodSample) == 40u, "method layout");
     CHECK(sizeof(CocosDebugIpcLuaEvent) == 40u, "event layout");
     /* Lines carry a qpc budget now, so the layout is 24 bytes, not 16. */

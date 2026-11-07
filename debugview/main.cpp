@@ -1814,6 +1814,91 @@ struct Application {
                 ImGui::EndTable();
             }
         }
+
+        if (ImGui::CollapsingHeader("getData 按文件##frame_file_io",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            float getdata_total = 0.0f;
+            for (size_t i = 0; i < frame->cpp_methods.size(); i++) {
+                const CppMethodSnapshot &item = frame->cpp_methods[i];
+                if (cocos_debug_snapshot_text(item.name).find(
+                        "FileUtilsWin32:getData") != std::string::npos) {
+                    getdata_total = item.total_ms;
+                    break;
+                }
+            }
+            ImGui::Text("本帧 getData 总耗时 %.3f ms", getdata_total);
+            if (frame->flags & COCOS_DEBUG_IPC_FRAME_FILE_IO_LIMITED)
+                ImGui::TextDisabled("路径数超限，多余路径合并到 <truncated>");
+            if (frame->file_io.empty()) {
+                ImGui::TextDisabled("本帧没有按文件的 getData 样本。");
+            } else if (ImGui::BeginTable("frame_file_io", 5,
+                                         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                             ImGuiTableFlags_Resizable |
+                                             ImGuiTableFlags_Sortable)) {
+                ImGui::TableSetupColumn("路径");
+                ImGui::TableSetupColumn("total ms");
+                ImGui::TableSetupColumn("max ms");
+                ImGui::TableSetupColumn("last ms");
+                ImGui::TableSetupColumn("calls");
+                ImGui::TableHeadersRow();
+                std::vector<const FileIoSnapshot *> rows;
+                rows.reserve(frame->file_io.size());
+                for (size_t i = 0; i < frame->file_io.size(); i++)
+                    rows.push_back(&frame->file_io[i]);
+                if (ImGuiTableSortSpecs *specs = ImGui::TableGetSortSpecs()) {
+                    if (specs->SpecsCount > 0) {
+                        const ImGuiTableColumnSortSpecs &spec = specs->Specs[0];
+                        std::sort(rows.begin(), rows.end(),
+                                  [&](const FileIoSnapshot *lhs,
+                                      const FileIoSnapshot *rhs) {
+                                      int comparison = 0;
+                                      switch (spec.ColumnIndex) {
+                                      case 0:
+                                          comparison =
+                                              cocos_debug_snapshot_text(lhs->path)
+                                                  .compare(cocos_debug_snapshot_text(
+                                                      rhs->path));
+                                          break;
+                                      case 1:
+                                          comparison = (lhs->total_ms > rhs->total_ms) -
+                                                       (lhs->total_ms < rhs->total_ms);
+                                          break;
+                                      case 2:
+                                          comparison = (lhs->max_ms > rhs->max_ms) -
+                                                       (lhs->max_ms < rhs->max_ms);
+                                          break;
+                                      case 3:
+                                          comparison = (lhs->last_ms > rhs->last_ms) -
+                                                       (lhs->last_ms < rhs->last_ms);
+                                          break;
+                                      default:
+                                          comparison = (lhs->calls > rhs->calls) -
+                                                       (lhs->calls < rhs->calls);
+                                          break;
+                                      }
+                                      return spec.SortDirection == ImGuiSortDirection_Ascending
+                                                 ? comparison < 0
+                                                 : comparison > 0;
+                                  });
+                    }
+                }
+                for (size_t i = 0; i < rows.size(); i++) {
+                    const FileIoSnapshot &item = *rows[i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(cocos_debug_snapshot_text(item.path).c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.total_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.max_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f", item.last_ms);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", (unsigned)item.calls);
+                }
+                ImGui::EndTable();
+            }
+        }
     }
 
     /* ---------- cross-frame analysis: aggregate / spike diff / curve ---------- */

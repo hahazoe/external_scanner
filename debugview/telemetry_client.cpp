@@ -235,14 +235,21 @@ bool TelemetryClient::pollIpcOnce() {
                 method_count = COCOS_DEBUG_IPC_METHOD_CAP;
             if (line_count > COCOS_DEBUG_IPC_LINE_CAP)
                 line_count = COCOS_DEBUG_IPC_LINE_CAP;
+            uint32_t file_io_count = scratch_->file_io_count;
             if (method_count > 0)
                 memcpy(scratch_->methods, source->methods,
                        method_count * sizeof(scratch_->methods[0]));
             if (line_count > 0)
                 memcpy(scratch_->lines, source->lines,
                        line_count * sizeof(scratch_->lines[0]));
+            if (file_io_count > COCOS_DEBUG_IPC_FILE_IO_CAP)
+                file_io_count = COCOS_DEBUG_IPC_FILE_IO_CAP;
+            if (file_io_count > 0)
+                memcpy(scratch_->file_io, source->file_io,
+                       file_io_count * sizeof(scratch_->file_io[0]));
             scratch_->method_count = method_count;
             scratch_->line_count = line_count;
+            scratch_->file_io_count = file_io_count;
         }
         scratch_->actor_x = source->actor_x;
         scratch_->actor_y = source->actor_y;
@@ -307,6 +314,18 @@ bool TelemetryClient::pollIpcOnce() {
             item.calls = value.calls;
             item.call_sequence = value.call_sequence;
             snapshot.cpp_methods.push_back(item);
+        }
+        snapshot.file_io.reserve(scratch_->file_io_count);
+        for (i = 0; i < scratch_->file_io_count && i < COCOS_DEBUG_IPC_FILE_IO_CAP;
+             i++) {
+            const CocosDebugIpcFileIoSample &value = scratch_->file_io[i];
+            FileIoSnapshot item;
+            item.path = cocos_debug_pool_intern(value.path);
+            item.total_ms = value.total_ms;
+            item.max_ms = value.max_ms;
+            item.last_ms = value.last_ms;
+            item.calls = value.calls;
+            snapshot.file_io.push_back(item);
         }
         snapshot.lua_lines.reserve(scratch_->line_count);
         for (i = 0; i < scratch_->line_count && i < COCOS_DEBUG_IPC_LINE_CAP; i++) {

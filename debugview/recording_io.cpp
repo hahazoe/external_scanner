@@ -16,8 +16,10 @@ static const char kMagic[8] = {'C', 'C', 'D', 'B', 'R', 'E', 'C', '1'};
    7: adds actor_x/actor_y/actor_valid after flags (legacy; always 0 now).
       Older files load with actor_valid = 0.
    8: adds proc_ws_kb/proc_private_kb after actor_valid. Older files load
-      with both fields 0. */
-static const uint32_t kVersion = 8;
+      with both fields 0.
+   9: after CppMethod entries, adds file_io_count + per-path getData samples.
+      Older files load with file_io empty. */
+static const uint32_t kVersion = 9;
 static const uint32_t kMinSupportedVersion = 5;
 
 static bool write_raw(FILE *fp, const void *data, size_t size) {
@@ -160,6 +162,18 @@ static bool write_frame(FILE *fp, const FrameSnapshot &frame) {
         if (!write_u32(fp, m.calls)) return false;
         if (!write_u32(fp, m.call_sequence)) return false;
     }
+    {
+        uint32_t file_io_count = (uint32_t)frame.file_io.size();
+        if (!write_u32(fp, file_io_count)) return false;
+        for (i = 0; i < file_io_count; i++) {
+            const FileIoSnapshot &m = frame.file_io[i];
+            if (!write_string(fp, cocos_debug_snapshot_text(m.path))) return false;
+            if (!write_f32(fp, m.total_ms)) return false;
+            if (!write_f32(fp, m.max_ms)) return false;
+            if (!write_f32(fp, m.last_ms)) return false;
+            if (!write_u32(fp, m.calls)) return false;
+        }
+    }
     for (i = 0; i < line_count; i++) {
         const LuaLineSnapshot &m = frame.lua_lines[i];
         if (!write_string(fp, cocos_debug_snapshot_text(m.source))) return false;
@@ -229,6 +243,7 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame, uint32_t version) {
         line_count > 1000000u || event_count > 10000000u) return false;
     frame->lua_methods.clear();
     frame->cpp_methods.clear();
+    frame->file_io.clear();
     frame->lua_lines.clear();
     frame->trace_events.clear();
     frame->lua_methods.reserve(lua_count);
@@ -266,6 +281,23 @@ static bool read_frame(FILE *fp, FrameSnapshot *frame, uint32_t version) {
         if (!read_u32(fp, &m.calls)) return false;
         if (!read_u32(fp, &m.call_sequence)) return false;
         frame->cpp_methods.push_back(m);
+    }
+    if (version >= 9) {
+        uint32_t file_io_count = 0;
+        if (!read_u32(fp, &file_io_count)) return false;
+        if (file_io_count > 100000u) return false;
+        frame->file_io.reserve(file_io_count);
+        for (i = 0; i < file_io_count; i++) {
+            FileIoSnapshot m;
+            std::string path;
+            if (!read_string(fp, &path)) return false;
+            m.path = cocos_debug_pool_intern(path);
+            if (!read_f32(fp, &m.total_ms)) return false;
+            if (!read_f32(fp, &m.max_ms)) return false;
+            if (!read_f32(fp, &m.last_ms)) return false;
+            if (!read_u32(fp, &m.calls)) return false;
+            frame->file_io.push_back(m);
+        }
     }
     for (i = 0; i < line_count; i++) {
         LuaLineSnapshot m;

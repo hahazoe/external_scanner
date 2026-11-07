@@ -1,13 +1,13 @@
-# .cocosdbg 录制格式参考（version 5 到 8）
+# .cocosdbg 录制格式参考（version 5 到 9）
 
 格式权威来源：`debugview/recording_io.cpp`（kMagic `CCDBREC1`）。全部小端序。
-当前写出的版本是 **8**；读取端必须同时接受 5、6、7、8（旧文件里较新的字段视为 0）。
+当前写出的版本是 **9**；读取端必须同时接受 5、6、7、8、9（旧文件里较新的字段视为 0）。
 
 ## 文件布局
 
 ```
 magic     8 bytes  "CCDBREC1"
-version   u32      = 5、6、7 或 8
+version   u32      = 5、6、7、8 或 9
 count     u64      帧数
 frames    count × Frame
 img_cnt   u32      预览图数量（可忽略，分析时读到帧结束即可）
@@ -26,6 +26,10 @@ images    img_cnt × Image
 **version 8 相对 7**：Frame 头在 `actor_valid` 之后、四个 count 之前插入
 `proc_ws_kb(f32) proc_private_kb(f32)`。`proc_ws_kb` 是任务管理器进程列表「内存」列的活动专用工作集，`proc_private_kb` 是私有提交，单位都是 KB。
 v7 及更早读出来这两个字段为 0。
+
+**version 9 相对 8**：在 CppMethod 列表之后、行采样之前插入
+`file_io_count(u32)` + `file_io_count × FileIoSample`（每帧 `FileUtilsWin32:getData` 按路径聚合）。
+v8 及更早读出来 `file_io` 为空。
 
 字符串统一为 `u32 长度 + 字节`（UTF-8，最长 1MB）。
 
@@ -78,6 +82,13 @@ max_incl_ms(f32) calls_started(u32) calls_completed(u32) active_at_end(u32)`
 ### CppMethod
 
 `name(str) total_ms(f32) max_ms(f32) last_ms(f32) calls(u32) call_sequence(u32)`
+
+### FileIoSample（仅 v9，紧接 CppMethod 之后）
+
+`path(str) total_ms(f32) max_ms(f32) last_ms(f32) calls(u32)`
+
+- 本帧内 `FileUtilsWin32:getData` 按传入路径聚合；总耗时仍看 CppMethod 里的 `FileUtilsWin32:getData`。
+- 路径数超限时多余路径合并到 `<truncated>`，帧 `flags` 含 `FILE_IO_LIMITED`（bit8）。
 
 ### 行采样
 

@@ -102,7 +102,15 @@ static uint32_t g_cocos_module_size = 0;
 typedef struct {
     uint32_t ret;
     double t0;
+    char path[COCOS_DEBUG_IPC_PATH_CAP];
 } CppHookRec;
+
+/* Per-thread call stack so worker-thread getData still restores its own ret.
+ * Timing / file_io are only recorded on the director/drawScene thread. */
+typedef struct {
+    int depth[CPP_HOOK_MAX];
+    CppHookRec recs[CPP_HOOK_MAX][CPP_HOOK_STACK];
+} CppHookTlsState;
 
 typedef struct {
     char name[CPP_NAME_LEN];
@@ -114,8 +122,6 @@ typedef struct {
     int stolen;
     int prologue_hook;
     void *stub;
-    CppHookRec recs[CPP_HOOK_STACK];
-    int depth;
     double last_begin;
     double last_end;
     double last_ms;
@@ -133,6 +139,17 @@ static CppHook g_cpp_hooks[CPP_HOOK_MAX];
 static int g_cpp_hook_count = 0;
 static int g_cpp_hooks_installed = 0;
 static int g_cpp_drawscene_id = -1;
+static int g_cpp_getdata_id = -1;
+static DWORD g_cpp_tls = TLS_OUT_OF_INDEXES;
+static CRITICAL_SECTION g_cpp_metrics_lock;
+static int g_cpp_metrics_lock_ready = 0;
+/* Tid of the thread that runs drawScene; 0 until first drawScene. */
+static volatile DWORD g_loop_thread_id = 0;
+
+/* Per-frame getData path aggregates. Published before roll clears them. */
+static CocosDebugIpcFileIoSample g_file_io[COCOS_DEBUG_IPC_FILE_IO_CAP];
+static uint32_t g_file_io_count = 0;
+static int g_file_io_limited = 0;
 
 static volatile LONG g_ds_frame_seq;
 static int g_ds_hook_installed;
@@ -143,6 +160,33 @@ static double prof_now(void) {
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&counter);
     return (double)counter.QuadPart / (double)freq.QuadPart;
+}
+
+static CppHookTlsState *cpp_tls_state(void) {
+    CppHookTlsState *s;
+    if (g_cpp_tls == TLS_OUT_OF_INDEXES)
+        return NULL;
+    s = (CppHookTlsState *)TlsGetValue(g_cpp_tls);
+    if (s)
+        return s;
+    s = (CppHookTlsState *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*s));
+    if (!s)
+        return NULL;
+    if (!TlsSetValue(g_cpp_tls, s)) {
+        HeapFree(GetProcessHeap(), 0, s);
+        return NULL;
+    }
+    return s;
+}
+
+static void cpp_metrics_enter(void) {
+    if (g_cpp_metrics_lock_ready)
+        EnterCriticalSection(&g_cpp_metrics_lock);
+}
+
+static void cpp_metrics_leave(void) {
+    if (g_cpp_metrics_lock_ready)
+        LeaveCriticalSection(&g_cpp_metrics_lock);
 }
 
 static void cpp_hooks_roll_frame(void);
@@ -159,8 +203,133 @@ static int install_one_cpp_hook(CppHook *h, int id);
 static void try_hook_live_renderer(uint32_t director);
 static void publish_pending_frame(float period_ms);
 
+static void file_io_roll_frame(void) {
+    g_file_io_count = 0;
+    g_file_io_limited = 0;
+    memset(g_file_io, 0, sizeof(g_file_io));
+}
+
+static void file_io_add_unlocked(const char *path, double ms) {
+    CocosDebugIpcFileIoSample *s = NULL;
+    uint32_t i;
+    float fms;
+    if (!path || !path[0])
+        path = "(unknown)";
+    fms = (float)ms;
+    if (!(fms >= 0.0f))
+        fms = 0.0f;
+    for (i = 0; i < g_file_io_count; i++) {
+        if (strncmp(g_file_io[i].path, path, COCOS_DEBUG_IPC_PATH_CAP) == 0) {
+            s = &g_file_io[i];
+            break;
+        }
+    }
+    if (!s) {
+        if (g_file_io_count < COCOS_DEBUG_IPC_FILE_IO_CAP) {
+            s = &g_file_io[g_file_io_count++];
+            memset(s, 0, sizeof(*s));
+            strncpy(s->path, path, COCOS_DEBUG_IPC_PATH_CAP - 1);
+            s->path[COCOS_DEBUG_IPC_PATH_CAP - 1] = 0;
+        } else {
+            g_file_io_limited = 1;
+            for (i = 0; i < g_file_io_count; i++) {
+                if (strcmp(g_file_io[i].path, "<truncated>") == 0) {
+                    s = &g_file_io[i];
+                    break;
+                }
+            }
+            if (!s) {
+                s = &g_file_io[COCOS_DEBUG_IPC_FILE_IO_CAP - 1];
+                strncpy(s->path, "<truncated>", COCOS_DEBUG_IPC_PATH_CAP - 1);
+                s->path[COCOS_DEBUG_IPC_PATH_CAP - 1] = 0;
+            }
+        }
+    }
+    s->last_ms = fms;
+    s->total_ms += fms;
+    s->calls++;
+    if (fms > s->max_ms)
+        s->max_ms = fms;
+}
+
+static int mem_range_readable(uint32_t addr, size_t len) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD protect;
+    uint32_t end;
+    if (addr < 0x10000u || len == 0)
+        return 0;
+    end = addr + (uint32_t)len;
+    if (end < addr)
+        return 0;
+    if (!VirtualQuery((const void *)(uintptr_t)addr, &mbi, sizeof(mbi)))
+        return 0;
+    if (mbi.State != MEM_COMMIT)
+        return 0;
+    if (mbi.Protect & PAGE_GUARD)
+        return 0;
+    protect = mbi.Protect & 0xFFu;
+    if (protect != PAGE_READONLY && protect != PAGE_READWRITE &&
+        protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READ &&
+        protect != PAGE_EXECUTE_READWRITE && protect != PAGE_EXECUTE_WRITECOPY)
+        return 0;
+    if ((uintptr_t)mbi.BaseAddress + mbi.RegionSize < (uintptr_t)end)
+        return 0;
+    return 1;
+}
+
+/*
+ * MSVC std::string (VS2015+ SSO): _Bx at 0, _Mysize at 16, _Myres at 20.
+ * Inline buffer when _Myres < 16; otherwise pointer at _Bx.
+ */
+static int read_msvc_std_string(uint32_t str_addr, char *out, size_t cap) {
+    uint32_t mysize, myres, data_addr;
+    if (!out || cap < 2 || !mem_range_readable(str_addr, 24))
+        return 0;
+    mysize = *(const uint32_t *)(uintptr_t)(str_addr + 16);
+    myres = *(const uint32_t *)(uintptr_t)(str_addr + 20);
+    if (mysize >= (uint32_t)cap || mysize > myres || myres > 0x01000000u)
+        return 0;
+    if (myres < 16u) {
+        data_addr = str_addr;
+    } else {
+        if (!mem_range_readable(str_addr, 4))
+            return 0;
+        data_addr = *(const uint32_t *)(uintptr_t)str_addr;
+        if (data_addr < 0x10000u)
+            return 0;
+    }
+    if (!mem_range_readable(data_addr, (size_t)mysize + 1u))
+        return 0;
+    memcpy(out, (const void *)(uintptr_t)data_addr, mysize);
+    out[mysize] = 0;
+    return 1;
+}
+
+/* first_stack_arg points at the hooked function's first stack argument
+ * (passed explicitly by build_cpp_hook_stub; do not derive from &id). */
+static int capture_getdata_path(uint32_t *first_stack_arg, char *out, size_t cap) {
+    uint32_t cand;
+    if (!out || cap < 2)
+        return 0;
+    out[0] = 0;
+    if (!first_stack_arg ||
+        !mem_range_readable((uint32_t)(uintptr_t)first_stack_arg, 8))
+        return 0;
+    cand = first_stack_arg[0];
+    if (read_msvc_std_string(cand, out, cap))
+        return 1;
+    /* Hidden Data* return slot: filename is the second stack arg. */
+    cand = first_stack_arg[1];
+    if (read_msvc_std_string(cand, out, cap))
+        return 1;
+    strncpy(out, "(unknown)", cap - 1);
+    out[cap - 1] = 0;
+    return 0;
+}
+
 static void cpp_hooks_roll_frame(void) {
     int i;
+    cpp_metrics_enter();
     for (i = 0; i < g_cpp_hook_count; i++) {
         CppHook *h = &g_cpp_hooks[i];
         h->prev_total = h->frame_total;
@@ -171,10 +340,13 @@ static void cpp_hooks_roll_frame(void) {
         h->frame_calls = 0;
         h->last_ms = 0;
     }
+    file_io_roll_frame();
+    cpp_metrics_leave();
 }
 
 static void cpp_hooks_reset_metrics(void) {
     int i;
+    cpp_metrics_enter();
     for (i = 0; i < g_cpp_hook_count; i++) {
         CppHook *h = &g_cpp_hooks[i];
         h->last_begin = h->last_end = h->last_ms = h->max_ms = 0;
@@ -183,52 +355,85 @@ static void cpp_hooks_reset_metrics(void) {
         h->prev_total = h->prev_max = 0;
         h->prev_calls = 0;
     }
+    file_io_roll_frame();
+    cpp_metrics_leave();
 }
 
-static void __attribute__((cdecl)) cpp_hook_begin(int id, uint32_t ret, uint32_t this_ptr) {
-    CppHook *h;
+static int cpp_on_loop_thread(void) {
+    DWORD loop = g_loop_thread_id;
+    return loop != 0 && GetCurrentThreadId() == loop;
+}
+
+static void __attribute__((cdecl)) cpp_hook_begin(int id, uint32_t ret, uint32_t this_ptr,
+                                                   uint32_t *stack_args) {
+    CppHookTlsState *tls;
+    int depth;
+    int time_this;
     if (id < 0 || id >= g_cpp_hook_count) return;
-    h = &g_cpp_hooks[id];
-    if (id == g_cpp_drawscene_id && h->depth == 0) {
+    tls = cpp_tls_state();
+    if (!tls) return;
+    depth = tls->depth[id];
+    if (id == g_cpp_drawscene_id && depth == 0) {
         double now = prof_now();
+        g_loop_thread_id = GetCurrentThreadId();
         /* Remote Lua runs from Scheduler (Lua context), not from this C++ hook. */
         remote_lua_tick_timeout();
         profiler_on_drawscene_begin(now, this_ptr);
     }
-    if (h->depth < CPP_HOOK_STACK) {
-        h->recs[h->depth].ret = ret;
-        h->recs[h->depth].t0 = g_recording ? prof_now() : 0;
+    /* getData: bookkeeping on every thread, timing only on the loop thread. */
+    time_this = g_recording &&
+                (id != g_cpp_getdata_id || cpp_on_loop_thread());
+    if (depth < CPP_HOOK_STACK) {
+        tls->recs[id][depth].ret = ret;
+        tls->recs[id][depth].t0 = time_this ? prof_now() : 0;
+        tls->recs[id][depth].path[0] = 0;
+        if (time_this && id == g_cpp_getdata_id)
+            capture_getdata_path(stack_args, tls->recs[id][depth].path,
+                                 sizeof(tls->recs[id][depth].path));
     }
-    h->depth++;
+    tls->depth[id] = depth + 1;
 }
 
 static uint32_t __attribute__((cdecl)) cpp_hook_end(int id) {
     CppHook *h;
+    CppHookTlsState *tls;
+    CppHookRec *rec;
     uint32_t ret = 0;
-    double t1, dt;
+    double t1, dt, ms;
+    int depth;
     if (id < 0 || id >= g_cpp_hook_count) return 0;
     h = &g_cpp_hooks[id];
-    if (h->depth <= 0) return 0;
-    h->depth--;
-    if (h->depth >= CPP_HOOK_STACK) return 0;
-    ret = h->recs[h->depth].ret;
-    if (h->recs[h->depth].t0 != 0) {
+    tls = cpp_tls_state();
+    if (!tls) return 0;
+    depth = tls->depth[id];
+    if (depth <= 0) return 0;
+    depth--;
+    tls->depth[id] = depth;
+    if (depth >= CPP_HOOK_STACK) return 0;
+    rec = &tls->recs[id][depth];
+    ret = rec->ret;
+    if (rec->t0 != 0) {
         t1 = prof_now();
-        dt = t1 - h->recs[h->depth].t0;
+        dt = t1 - rec->t0;
         if (dt < 0) dt = 0;
-        h->last_begin = h->recs[h->depth].t0;
+        ms = dt * 1000.0;
+        cpp_metrics_enter();
+        h->last_begin = rec->t0;
         h->last_end = t1;
-        h->last_ms = dt * 1000.0;
-        h->frame_total += h->last_ms;
+        h->last_ms = ms;
+        h->frame_total += ms;
         h->frame_calls++;
-        if (h->last_ms > h->frame_max) h->frame_max = h->last_ms;
-        if (h->last_ms > h->max_ms) h->max_ms = h->last_ms;
+        if (ms > h->frame_max) h->frame_max = ms;
+        if (ms > h->max_ms) h->max_ms = ms;
+        if (id == g_cpp_getdata_id)
+            file_io_add_unlocked(rec->path[0] ? rec->path : "(unknown)", ms);
+        cpp_metrics_leave();
         InterlockedIncrement(&h->seq);
         if (id == g_cpp_drawscene_id)
             g_ds_frame_seq = h->seq;
     }
     /* Always tick on drawScene return so Start can be observed while idle. */
-    if (id == g_cpp_drawscene_id && h->depth == 0)
+    if (id == g_cpp_drawscene_id && depth == 0)
         profiler_on_drawscene_end();
     return ret;
 }
@@ -249,15 +454,23 @@ static int build_cpp_hook_stub(CppHook *h, int id, uint32_t resume_addr) {
     }
     s = (uint8_t *)h->stub;
 
+    /*
+     * Entry ESP: [ret][arg0][arg1]...
+     * cdecl begin(id, ret, this_ptr, stack_args) — push right-to-left.
+     * stack_args points at the hooked function's first stack arg (arg0).
+     */
     s[i++] = 0x51; /* push ecx (save this) */
-    s[i++] = 0x51; /* push ecx (this_ptr arg) */
-    s[i++] = 0xFF; s[i++] = 0x74; s[i++] = 0x24; s[i++] = 0x08; /* push ret */
+    /* [ecx_save][ret][arg0] → arg0 at +8 */
+    s[i++] = 0x8D; s[i++] = 0x44; s[i++] = 0x24; s[i++] = 0x08; /* lea eax,[esp+8] */
+    s[i++] = 0x50; /* push eax (stack_args) */
+    s[i++] = 0x51; /* push ecx (this_ptr) */
+    s[i++] = 0xFF; s[i++] = 0x74; s[i++] = 0x24; s[i++] = 0x0C; /* push [esp+12]=ret */
     s[i++] = 0x68;
-    memcpy(s + i, &id32, 4); i += 4;
+    memcpy(s + i, &id32, 4); i += 4; /* push id */
     s[i++] = 0xE8;
     rel = (int32_t)(begin_addr - ((uint32_t)(uintptr_t)(s + i + 4)));
     memcpy(s + i, &rel, 4); i += 4;
-    s[i++] = 0x83; s[i++] = 0xC4; s[i++] = 0x0C; /* add esp, 12 */
+    s[i++] = 0x83; s[i++] = 0xC4; s[i++] = 0x10; /* add esp, 16 */
     s[i++] = 0x59; /* pop ecx */
     s[i++] = 0xC7; s[i++] = 0x04; s[i++] = 0x24;
     epilog_slot = i;
@@ -430,7 +643,6 @@ static void remove_one_cpp_hook(CppHook *h) {
     h->site_count = 0;
     h->prologue_hook = 0;
     h->installed = 0;
-    h->depth = 0;
 }
 
 static int add_cpp_hook_target(const char *name, uint32_t addr) {
@@ -438,8 +650,12 @@ static int add_cpp_hook_target(const char *name, uint32_t addr) {
     int i;
     if (!name || !name[0] || addr < 0x10000) return -1;
     for (i = 0; i < g_cpp_hook_count; i++) {
-        if (!_stricmp(g_cpp_hooks[i].name, name) || g_cpp_hooks[i].orig == addr)
+        if (!_stricmp(g_cpp_hooks[i].name, name) || g_cpp_hooks[i].orig == addr) {
+            if (strstr(name, "FileUtilsWin32:getData") ||
+                strstr(g_cpp_hooks[i].name, "FileUtilsWin32:getData"))
+                g_cpp_getdata_id = i;
             return i;
+        }
     }
     if (g_cpp_hook_count >= CPP_HOOK_MAX) return -1;
     h = &g_cpp_hooks[g_cpp_hook_count];
@@ -448,6 +664,8 @@ static int add_cpp_hook_target(const char *name, uint32_t addr) {
     h->orig = addr;
     if (strstr(name, "drawScene"))
         g_cpp_drawscene_id = g_cpp_hook_count;
+    if (strstr(name, "FileUtilsWin32:getData"))
+        g_cpp_getdata_id = g_cpp_hook_count;
     return g_cpp_hook_count++;
 }
 
@@ -617,6 +835,7 @@ static void publish_precise_frame(const CocosDebugLuaProfilerFrame *frame) {
     out->actor_x = 0.0f;
     out->actor_y = 0.0f;
     out->actor_valid = 0;
+    cpp_metrics_enter();
     out->cpp_count = (uint32_t)g_cpp_hook_count;
     if (out->cpp_count > COCOS_DEBUG_IPC_CPP_CAP)
         out->cpp_count = COCOS_DEBUG_IPC_CPP_CAP;
@@ -630,6 +849,15 @@ static void publish_precise_frame(const CocosDebugLuaProfilerFrame *frame) {
         dst->calls = (uint32_t)src->frame_calls;
         dst->call_sequence = (uint32_t)src->seq;
     }
+    out->file_io_count = g_file_io_count;
+    if (out->file_io_count > COCOS_DEBUG_IPC_FILE_IO_CAP)
+        out->file_io_count = COCOS_DEBUG_IPC_FILE_IO_CAP;
+    if (out->file_io_count > 0)
+        memcpy(out->file_io, g_file_io,
+               out->file_io_count * sizeof(out->file_io[0]));
+    if (g_file_io_limited)
+        out->flags |= COCOS_DEBUG_IPC_FRAME_FILE_IO_LIMITED;
+    cpp_metrics_leave();
     cocos_debug_telemetry_end_frame(out);
 }
 
@@ -1524,11 +1752,22 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID v) {
     (void)v;
     if (r == DLL_PROCESS_ATTACH) {
         HANDLE t;
+        g_cpp_tls = TlsAlloc();
+        InitializeCriticalSection(&g_cpp_metrics_lock);
+        g_cpp_metrics_lock_ready = 1;
         DisableThreadLibraryCalls(h);
         t = CreateThread(NULL, 0, thread, NULL, 0, NULL);
         if (t) CloseHandle(t);
     } else if (r == DLL_PROCESS_DETACH) {
         cocos_debug_telemetry_close();
+        if (g_cpp_metrics_lock_ready) {
+            DeleteCriticalSection(&g_cpp_metrics_lock);
+            g_cpp_metrics_lock_ready = 0;
+        }
+        if (g_cpp_tls != TLS_OUT_OF_INDEXES) {
+            TlsFree(g_cpp_tls);
+            g_cpp_tls = TLS_OUT_OF_INDEXES;
+        }
     }
     return TRUE;
 }
